@@ -1,0 +1,14 @@
+# --- OS Specific ---
+.DS_Store
+**/.DS_Store
+
+# --- Compiled Binaries ---
+bin/
+build/
+*.exe
+*.out
+
+# --- Large AI Files ---
+*.bin
+*.pt
+data/
