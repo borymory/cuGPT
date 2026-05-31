@@ -1,7 +1,7 @@
 #pragma once
 #include "hpc_utils.cuh"
 
-namespace FlashLab::Benchmark {
+namespace cuGPT::Benchmark {
 
     template <typename T>
     void benchmark_kernel (

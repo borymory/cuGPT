@@ -12,7 +12,7 @@
 
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
 
-#define CHECK_LAST_CUDA_ERROR() FlashLab::checkLast(__FILE__, __LINE__)
+#define CHECK_LAST_CUDA_ERROR() cuGPT::checkLast(__FILE__, __LINE__)
 
 #define CUDA_CHECK(expr_to_check) do {            \
     cudaError_t result  = expr_to_check;          \
@@ -27,7 +27,7 @@
     }                                             \
 } while(0)
 
-namespace FlashLab {
+namespace cuGPT {
 
     double get_time_ms();
 

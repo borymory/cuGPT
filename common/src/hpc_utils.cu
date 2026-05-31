@@ -1,6 +1,6 @@
 #include "hpc_utils.cuh"
 
-namespace FlashLab {
+namespace cuGPT {
 
   double get_time_ms() {
       struct timeval tv;
