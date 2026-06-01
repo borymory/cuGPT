@@ -1,7 +1,6 @@
 #include <cstdio>
 #include "hpc_utils.cuh"
 #include "mlp.cuh"
-#include "tests.cuh"
 
 // -- VERIFY FUNCTIONS --
 // For elements wise verification, use validate func given in ./common/hpc_utils.cu
@@ -48,4 +47,9 @@ bool test_fused_bias_ReLU_v1() {
 
   if (isExact) return true; // VERIFY KERNEL
   return false;
+}
+
+int main(void) {
+  std::printf("Running MLP Test...\n");
+  if (test_fused_bias_ReLU_v1()) std::printf("Succes!");
 }

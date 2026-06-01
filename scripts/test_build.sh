@@ -11,13 +11,12 @@ fi
 
 echo "🔨 Building Test Suite for: $LAYER"
 
-# We compile:
-# 1. The specific test file (tests/test_layernorm.cu)
-# 2. Every layer implementation (src/layers/*.cu) so the linker can find the logic
-# 3. Every common utility (common/src/*.cu)
+# Compile:
+# common headers and .cu files
+# test_(layername).cu file
+# (layername).cu file in src/layers
 nvcc -I./common/include \
      -I./src/layers \
-     tests/test_layer.cu \
      tests/test_${LAYER}.cu \
      src/layers/${LAYER}.cu \
      common/src/*.cu \
