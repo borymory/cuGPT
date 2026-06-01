@@ -57,6 +57,19 @@ void cpu_bias_ReLU (float *h_out, float *out, float *b1,
     }
 }
 
+// Second layer bias + residual
+// X: [B * T, C]
+// h_out: [B * T, C]
+// b2: [C]
+void cpu_bias_residual (float *X, float *h_out, float *out, 
+                        float *b2, int BT, int C) {
+    int element_size = BT * C;
+    for (unsigned int data_idx = 0; data_idx < element_size; ++data_idx) {
+        int bias_idx = data_idx % C; // Extract column_idx for corresponding bias
+        out[data_idx] = h_out[data_idx] + b2[bias_idx] + X[data_idx];
+    }
+}
+
 //
 // GPU Kernels
 //
@@ -72,13 +85,18 @@ __global__ void fused_bias_ReLU_v1 (float *h_out, float *b1,
 
     // Offset blocks to rows
     int rowIdx = blockIdx.x * block_BT;
-    h_out += rowIdx * (4 * C);
+    h_out += rowIdx * (4*C);
 
     int tx = threadIdx.x;
-    for (unsigned int idx = 0; idx < 4 * C * block_BT; idx += blockDim.x) {
-        if (tx + idx < 4 * C * block_BT) {
-            int bias_idx = idx % (4*C);
-            h_out[tx + idx] = fmaxf(0.0f, h_out[tx + idx] + b1[bias_idx]);
+    // View data in block linearly
+    int element_size = block_BT * 4 * C;
+
+    for (unsigned int idx = 0; idx < element_size; idx += blockDim.x) {
+        // failsafe if dataIdx overshoots element_size
+        int dIdx = tx + idx;
+        if (dIdx < element_size) {
+            int biasIdx = dIdx % (4*C);
+            h_out[dIdx] = fmaxf(0.0f, h_out[dIdx] + b1[biasIdx]);
         }
     }
 }
@@ -87,9 +105,30 @@ __global__ void fused_bias_ReLU_v1 (float *h_out, float *b1,
 // X: [B * T, C]
 // h_out: [B * T, C]
 // b2: [C]
+template<const int block_BT>
 __global__ void fused_bias_residual_v1 (float *X, float *h_out, float *b2, 
                                             int BT, int C) {
-    // code here
+    // Each block is responsible for block_BT many rows
+    // We launch CEIL_DIV(BT, block_BT) many blocks
+
+    // Offset blocks to rows
+    int rowIdx = blockIdx.x * block_BT;
+    h_out += rowIdx * C;
+    X += rowIdx * C;
+
+    int tx = threadIdx.x;
+    // View data in block linearly
+    int element_size = block_BT * C;
+
+    // Element wise addition
+    for (unsigned int idx = 0; idx < element_size; idx += blockDim.x) {
+        // failsafe if condition
+        int dIdx = tx + idx;
+        if (dIdx < element_size) {
+            int biasIdx = dIdx % C;
+            h_out[dIdx] += X[dIdx] + b2[biasIdx];
+        }
+    }
 }
 
 //
@@ -103,6 +142,21 @@ void launch_fused_bias_ReLU_v1 (float *h_out, float *b1,
     dim3 blockDim(block_BT * 32);
 
     fused_bias_ReLU_v1<block_BT><<<gridDim, blockDim, 0, stream>>>(h_out, b1, BT, C);
+
+    // Check for launch errors (like passing a CPU pointer!)
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+            printf("Kernel Launch Error: %s\n", cudaGetErrorString(err));
+}
+
+void launch_fused_bias_residual_v1 (float *X, float *h_out, float *b2, 
+                                            int BT, int C, cudaStream_t stream) {
+
+    const int block_BT = 32;
+    dim3 gridDim(CEIL_DIV(BT, block_BT));
+    dim3 blockDim(block_BT * 32);
+
+    fused_bias_residual_v1<block_BT><<<gridDim, blockDim, 0, stream>>>(X, h_out, b2, BT, C);
 
     // Check for launch errors (like passing a CPU pointer!)
         cudaError_t err = cudaGetLastError();
