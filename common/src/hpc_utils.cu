@@ -76,6 +76,23 @@ namespace cuGPT {
         }
     }
 
+  // A: [M, K]
+  // B: [K, N]
+  // All are row-major GPU pointers
+  // C = A@B
+  void gemm(cublasHandle_t cublas_handle, float *A, float *B, float *C, int M, int N, int K) {
+    float alpha = 1.0f;
+    float beta = 0.0f;
+
+    CUDA_CHECK(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, 
+                            N, M, K, 
+                            &alpha, 
+                            B, N, 
+                            A, K, 
+                            &beta, 
+                            C, N));
+  }
+  
 }
 
 

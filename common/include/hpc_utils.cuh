@@ -43,6 +43,8 @@ namespace cuGPT {
 
     void checkLast(const char* const file, const int line);
 
+    void gemm(cublasHandle_t handle, float *A, float *B, float *C, int M, int N, int K);
+
     //
     // Overload Functions
     //
