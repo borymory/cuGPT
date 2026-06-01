@@ -97,5 +97,7 @@ bool test_fused_bias_residual_v1() {
 
 int main(void) {
   std::printf("Running MLP Test...\n");
-  if (test_fused_bias_residual_v1()) std::printf("Succes!\n");
+  
+  string kernel_name = "fused_bias_residual_v1";
+  if (test_fused_bias_residual_v1()) std::printf("Kernel Name: %s | Status: Succes!\n", kernel_name);
 }
