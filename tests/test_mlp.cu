@@ -96,6 +96,7 @@ bool test_fused_bias_residual_v1() {
 }
 
 bool test_mlp_forward_v1() {
+  std::printf("Running test_mlp_forward_v1...\n");
   cublasHandle_t cublas_handle;
   cublasCreate(&cublas_handle);
   cudaStream_t stream;
@@ -139,8 +140,12 @@ bool test_mlp_forward_v1() {
   cuGPT::initMatrix(b2, 1, C);
 
   // Obtain cpu, gpu results and compare
+  std::printf("Running CPU MLP Function... | ");
   cpu_mlp_forward(X, out_cpu, W1, b1, W2, b2, B*T, C);
+  std::printf("✅ CPU MLP Function Finished\n");
+  std::printf("Running GPU MLP Kernel... | ");
   mlp_forward_v1(cublas_handle, X, h_out, out, W1, b1, W2, b2, B*T, C, stream);
+  std::printf("✅ GPU MLP Kernel Finished\n");
   CUDA_CHECK(cudaDeviceSynchronize());
   bool isExact = cuGPT::validate(out, out_cpu, B*T*C);
 
@@ -160,6 +165,6 @@ bool test_mlp_forward_v1() {
 }
 
 int main(void) {
-  std::printf("Running MLP Test...\n");
+  std::printf("Running Test...\n");
   if (test_mlp_forward_v1()) std::printf("Succes!\n");
 }

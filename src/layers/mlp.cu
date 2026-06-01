@@ -114,7 +114,7 @@ __global__ void fused_bias_residual_v1 (float *X, float *out, float *b2,
 
     // Offset blocks to rows
     int rowIdx = blockIdx.x * block_BT;
-    h_out += rowIdx * C;
+    out += rowIdx * C;
     X += rowIdx * C;
 
     int tx = threadIdx.x;
@@ -127,7 +127,7 @@ __global__ void fused_bias_residual_v1 (float *X, float *out, float *b2,
         int dIdx = tx + idx;
         if (dIdx < element_size) {
             int biasIdx = dIdx % C;
-            h_out[dIdx] += X[dIdx] + b2[biasIdx];
+            out[dIdx] += X[dIdx] + b2[biasIdx];
         }
     }
 }
@@ -184,7 +184,7 @@ void mlp_forward_v1(cublasHandle_t cublas_handle,
                     int BT, int C, cudaStream_t stream) {
     
     cublasSetStream(cublas_handle, stream);
-    
+
     // X [BT, C] * W1 [C, 4C] -> h_out [BT, 4C]
     cuGPT::gemm(cublas_handle, X, W1, h_out, BT, 4 * C, C);
 

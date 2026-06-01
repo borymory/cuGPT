@@ -84,13 +84,18 @@ namespace cuGPT {
     float alpha = 1.0f;
     float beta = 0.0f;
 
-    CUDA_CHECK(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, 
+    cublasStatus_t status = cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, 
                             N, M, K, 
                             &alpha, 
                             B, N, 
                             A, K, 
                             &beta, 
-                            C, N));
+                            C, N);
+
+    if (status != CUBLAS_STATUS_SUCCESS) {
+            std::printf("cuBLAS Error: GEMM failed to execute\n");
+            std::exit(EXIT_FAILURE);
+    }
   }
   
 }

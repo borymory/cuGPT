@@ -20,6 +20,7 @@ nvcc -I./common/include \
      tests/test_${LAYER}.cu \
      src/layers/${LAYER}.cu \
      common/src/*.cu \
+     -lcublas \
      -o bin/test_${LAYER}
 
 if [ $? -eq 0 ]; then
