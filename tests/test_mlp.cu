@@ -97,5 +97,5 @@ bool test_fused_bias_residual_v1() {
 
 int main(void) {
   std::printf("Running MLP Test...\n");
-  if (test_fused_bias_residual_v1()) std::printf("Succes!");
+  if (test_fused_bias_residual_v1()) std::printf("Succes!\n");
 }

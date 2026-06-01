@@ -54,6 +54,12 @@ namespace cuGPT {
           std::printf("CPU: %f\n", cpu_res[i]);
           return false;
         }
+        // just for fun
+        if (i == 3) {
+          std::printf("Index %d Output:\n", i);
+          std::printf("GPU: %f\n", gpu_res[i]);
+          std::printf("CPU: %f\n", cpu_res[i]);
+        }
     }
     return true;
   }
