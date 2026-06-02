@@ -21,7 +21,7 @@ void cpu_layernorm_fwd(float *X, float *X_norm, float *alpha, float *beta, int B
         // find variance
         sum = 0.0f;
         for (unsigned int k = 0; k < C; ++k){
-            float diff = X[i * C + k] - mean
+            float diff = X[i * C + k] - mean;
             sum += diff * diff;
         }
         float std_dev = std::sqrt((sum / C) + eps);
@@ -42,6 +42,7 @@ template<const int block_BT>
 __global__ void layernorm_fwd_v1(float *X, float *X_norm, float *alpha, float *beta, int BT, int C) {
     // Launch CEIL_DIV(BT, block_BT) many blocks
     // Launch block_BT * 32 many threads
+    const float eps = 1e-5f;    // to prevent divide by zero error
 
     int tx = threadIdx.x % 32;
     int ty = threadIdx.x / 32;
@@ -62,7 +63,7 @@ __global__ void layernorm_fwd_v1(float *X, float *X_norm, float *alpha, float *b
     }
 
     for (unsigned int mirrorIdx = 1; mirrorIdx <= 16; mirrorIdx <<= 1) {
-        mean += __shfl_xor_sync(FULL_MASK, sum, mirrorIdx);
+        mean += __shfl_xor_sync(FULL_MASK, mean, mirrorIdx);
     }
     mean /= C;
     
@@ -80,10 +81,10 @@ __global__ void layernorm_fwd_v1(float *X, float *X_norm, float *alpha, float *b
     for (unsigned int mirrorIdx = 1; mirrorIdx <= 16; mirrorIdx <<= 1) {
         std_dev += __shfl_xor_sync(FULL_MASK, std_dev, mirrorIdx);
     }
-    std_dev = sqrt(std_dev / C);
+    std_dev = sqrt((std_dev / C) + eps);
 
     // Update and load to X_norm
-    for (unsigned int i = 0; i < C += 32) {
+    for (unsigned int i = 0; i < C; i += 32) {
         int dIdx = tx + i;
         // failsafe if C is not a multiple of 32
         if (dIdx < C) {

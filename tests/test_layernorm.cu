@@ -29,19 +29,19 @@ bool test_layernorm_forward_v1() {
   CUDA_CHECK(cudaStreamCreate(&stream));
 
   // -- VERIFY KERNEL RUN --
-  cuGPT::initMatrix(X, B * T * C);
+  cuGPT::initMatrix(X, B * T, C);
   cuGPT::initMatrix(alpha, 1, C);
   cuGPT::initMatrix(beta, 1, C);
 
   std::printf("Running CPU Layernorm... | ");
-  cpu_layernorm_fwd(X, X_norm_cpu, alpha, beta, BT, C);
+  cpu_layernorm_fwd(X, X_norm_cpu, alpha, beta, B * T, C);
   std::printf("✅ CPU Layernorm Finished\n");
 
   std::printf("Running GPU Layernorm Kernel... | ");
-  layernorm_forward_v1(X, X_norm, alpha, beta, BT, C, stream);
+  layernorm_forward_v1(X, X_norm, alpha, beta, B * T, C, stream);
   CUDA_CHECK(cudaDeviceSynchronize());
   std::printf("✅ GPU Layernorm Finished\n");
-  
+
   bool isExact = cuGPT::validate(X_norm, X_norm_cpu, B * T * C);
 
   // FREE MEMORY ALLOCATION
