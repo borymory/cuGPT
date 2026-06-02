@@ -12,22 +12,10 @@ git clone https://github.com/borymory/cuGPT.git
 
 ```
 cd cuGPT
-```
 
-```
 chmod +x scripts/test_build.sh
-```
 
-**Run using build.sh and specify name for the layer. E.g.:**
-
-```
-./scripts/test_build.sh (layer_name)
-```
-
-**E.g.:**
-
-```
-./scripts/test_build.sh mlp
+./scripts/test_build.sh layernorm
 ```
 
 ## **The Current Timeline**

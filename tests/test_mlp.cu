@@ -145,8 +145,9 @@ bool test_mlp_forward_v1() {
   std::printf("✅ CPU MLP Function Finished\n");
   std::printf("Running GPU MLP Kernel... | ");
   mlp_forward_v1(cublas_handle, X, h_out, out, W1, b1, W2, b2, B*T, C, stream);
-  std::printf("✅ GPU MLP Kernel Finished\n");
   CUDA_CHECK(cudaDeviceSynchronize());
+  std::printf("✅ GPU MLP Kernel Finished\n");
+  
   bool isExact = cuGPT::validate(out, out_cpu, B*T*C);
 
   // FREE MEMORY ALLOCATION

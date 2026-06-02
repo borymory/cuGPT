@@ -146,9 +146,9 @@ void launch_fused_bias_ReLU_v1 (float *h_out, float *b1,
     fused_bias_ReLU_v1<block_BT><<<gridDim, blockDim, 0, stream>>>(h_out, b1, BT, C);
 
     // Check for launch errors (like passing a CPU pointer!)
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess)
-            printf("Kernel Launch Error: %s\n", cudaGetErrorString(err));
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+        printf("Kernel Launch Error: %s\n", cudaGetErrorString(err));
 }
 
 void launch_fused_bias_residual_v1 (float *X, float *out, float *b2, 
@@ -161,9 +161,9 @@ void launch_fused_bias_residual_v1 (float *X, float *out, float *b2,
     fused_bias_residual_v1<block_BT><<<gridDim, blockDim, 0, stream>>>(X, out, b2, BT, C);
 
     // Check for launch errors (like passing a CPU pointer!)
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess)
-            printf("Kernel Launch Error: %s\n", cudaGetErrorString(err));
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+        printf("Kernel Launch Error: %s\n", cudaGetErrorString(err));
 }
 
 //
