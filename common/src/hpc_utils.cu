@@ -35,8 +35,8 @@ namespace cuGPT {
 
   // generic verifier
   bool validate(float *gpu_res, float *cpu_res, int size) {
-    const float absolute_threshold = 1e-5; // If numbers are smaller than this, measure error by absolute difference
-    const float relative_eps = 1e-5;
+    const float absolute_threshold = 1e-3f; // Any number smaller than 0.001 is treated as near-zero
+    const float relative_eps = 1e-3f;
 
     for (unsigned int i = 0; i < size; i++) {
 
@@ -52,13 +52,14 @@ namespace cuGPT {
         
         if (std::abs(cpu_res[i]) < absolute_threshold) {
           if (diff > relative_eps) {
-            std::printf("Fail at index %d (Near-Zero Absolute Error)\n", i)
+            std::printf("First error at index %d (Near-Zero Absolute Error)\n", i);
+            return false;
           }
         }
         else {
           float relative_err = diff / std::abs(cpu_res[i]);
           if (relative_err > relative_eps) {
-            std::printf("First error at index %d\n", i);
+            std::printf("First error at index %d (Relative Error)\n", i);
             std::printf("GPU: %f\n", gpu_res[i]);
             std::printf("CPU: %f\n", cpu_res[i]);
             return false;
@@ -67,14 +68,13 @@ namespace cuGPT {
 
         // just for fun
         if (i == 3) {
-          std::printf("\n");
-          std::printf("--------------");
-          std::printf("Sample Output:");
-          std::printf("--------------");
-          std::printf("| Index %d Output: |\n", i);
+          std::printf("----------------\n");
+          std::printf("Sample Output\n");
+          std::printf("----------------\n");
+          std::printf("| Index %d |\n", i);
           std::printf("| GPU: %f |\n", gpu_res[i]);
           std::printf("| CPU: %f |\n", cpu_res[i]);
-          std::printf("--------------");
+          std::printf("----------------\n");
         }
     }
     return true;

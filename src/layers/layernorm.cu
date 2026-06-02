@@ -81,7 +81,7 @@ __global__ void layernorm_fwd_v1(float *X, float *X_norm, float *alpha, float *b
     for (unsigned int mirrorIdx = 1; mirrorIdx <= 16; mirrorIdx <<= 1) {
         std_dev += __shfl_xor_sync(FULL_MASK, std_dev, mirrorIdx);
     }
-    std_dev = sqrt((std_dev / C) + eps);
+    std_dev = sqrtf((std_dev / C) + eps);
 
     // Update and load to X_norm
     for (unsigned int i = 0; i < C; i += 32) {
