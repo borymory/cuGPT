@@ -25,14 +25,15 @@ The goal is understanding design considerations rather than reproducing existing
 - [x] Layernorm
 - [x] FeedForward Neural Network
 - [x] Token Embedding + Positional Embedding
+- [x] Online Softmax (with TOP-K)
+- [x] Logits Sampler
 
 ## **In Progress**
 
-- [ ] Online Softmaxs
-- [ ] Online Softmax (with TOP-K)
-- [ ] Flash Attention
+- [ ] Flash Attention + Causal Mask
 - [ ] Parameter Loading
 - [ ] Tensor Parameter Adressing
+- [ ] **Main Inference Loop**
 
 # **Quick Start**
 
