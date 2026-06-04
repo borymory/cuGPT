@@ -53,6 +53,8 @@ namespace cuGPT {
         if (std::abs(cpu_res[i]) < absolute_threshold) {
           if (diff > relative_eps) {
             std::printf("First error at index %d (Near-Zero Absolute Error)\n", i);
+            std::printf("GPU: %f\n", gpu_res[i]);
+            std::printf("CPU: %f\n", cpu_res[i]);
             return false;
           }
         }

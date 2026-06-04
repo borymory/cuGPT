@@ -14,8 +14,8 @@ bool test_embedding_v1() {
   float *wpe;
   float *out_cpu;
 
-  int B = 32;
-  int T = 32;
+  int B = 4;
+  int T = 256;
   int C = 512;
   int vocab_size = 50257;
   int max_length = 1024;
@@ -37,7 +37,7 @@ bool test_embedding_v1() {
   cuGPT::initMatrix(wpe, max_length, C);
 
   std::printf("Running CPU Embedding... | ");
-  cpu_embedding(inputs, out, wte, wpe, B, T, C);
+  cpu_embedding(inputs, out_cpu, wte, wpe, B, T, C);
   std::printf("✅ CPU Embedding Finished\n");
 
   std::printf("Running GPU Embedding... | ");

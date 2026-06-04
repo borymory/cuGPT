@@ -1,10 +1,42 @@
+<p align="center">
+  <img src="images/cuGPT_banner.png" width="100%" alt="cuGPT banner">
+</p>
+
 # **cuGPT**
 
-this will be a long journey and it will be about creating a small GPT like LLM that can run on a single GPU. Tag along as I learn over how to implement this without creating a mess.
+Inference engine on GPT-2 (124M) model, in raw C/CUDA. Currently being tested for NVIDIA Tesla T4.
 
-## **Repetitive Launch Commands**
+# **Project Goal**
 
-**Clone a branch or the main. E.g.:**
+Build GPT-2 inference avoiding existing frameworks.
+
+Constraints:
+* Raw C and CUDA kernels
+* First readibility and maintainability, second optimization
+* Building from bottom to top: Kernels and Functions -> Layer -> Transformer
+* Current approach set to first independently validate kernels, then combine.
+
+The goal is understanding design considerations rather than reproducing existing engines.
+
+# **Current Status**
+
+## **Implemented**
+
+- [x] Layernorm
+- [x] FeedForward Neural Network
+- [x] Token Embedding + Positional Embedding
+
+## **In Progress**
+
+- [ ] Online Softmaxs
+- [ ] Online Softmax (with TOP-K)
+- [ ] Flash Attention
+- [ ] Parameter Loading
+- [ ] Tensor Parameter Adressing
+
+# **Quick Start**
+
+**Current development is concentrated at the layer level. E.g., to test a single layer:**
 
 ```
 git clone https://github.com/borymory/cuGPT.git
@@ -18,6 +50,19 @@ chmod +x scripts/test_build.sh
 ./scripts/test_build.sh layernorm
 ```
 
-## **The Current Timeline**
+# **Roadmap**
 
-I am currently gathering and reading through sources over how I can implement this. So far I have decided to follow the simple rule: "C manages, CUDA computes". The main idea from what I've understood is to make C manage CUDA calls in the order of a transformer and do proper memory allocations before the transformer run, and the CUDA kernels are responsible for doing the inference calculations. I hope to protect this oversimplification and keep this as readable and maintainable as possible.
+Inference:
+
+- [ ] GPT-2 forward pass
+    - [ ] KV-cache
+
+Future Direction:
+
+* Training
+* Modular tensor parameters and transformer model using struct logic
+* Python wrapper for readibility
+
+## **Notes**
+
+Development notes and research live in /research.
