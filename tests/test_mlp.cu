@@ -96,7 +96,6 @@ bool test_fused_bias_residual_v1() {
 }
 
 bool test_mlp_forward_v1() {
-  std::printf("Running test_mlp_forward_v1...\n");
   cublasHandle_t cublas_handle;
   cublasCreate(&cublas_handle);
   cudaStream_t stream;

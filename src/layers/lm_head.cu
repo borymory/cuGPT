@@ -27,13 +27,12 @@ void cpu_lm_head_fwd(float *X_final, float *wte,
 
 // X_final[BT, C], wte[vocab_size, C] (weight-tying), logits[BT, vocab_size]
 void lm_head_fwd(cublasHandle_t cublas_handle, 
-                float *X_final, 
-                float *wte, 
+                const float *X_final, 
+                const float *wte, 
                 float *logits, 
                 int BT, 
                 int C, 
-                int 
-                vocab_size, 
+                int vocab_size, 
                 cudaStream_t stream) {
     
     cublasSetStream(cublas_handle, stream);

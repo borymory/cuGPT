@@ -10,6 +10,10 @@
 #include <unistd.h>
 #include <sys/time.h>
 
+#include <cuda_fp16.h>
+#include <nvcuda/wmma.h>
+using namespace nvcuda;
+
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
 
 #define CHECK_LAST_CUDA_ERROR() cuGPT::checkLast(__FILE__, __LINE__)

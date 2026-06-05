@@ -11,17 +11,16 @@
 
 // CPU Reference Funcs
 void cpu_lm_head_fwd(float *X_final, float *wte, 
-                    float *logits, int BT, 
-                    int C, int vocab_size);
+    float *logits, int BT, 
+    int C, int vocab_size);
 
 
 // LM head implementations
 void lm_head_fwd(cublasHandle_t cublas_handle, 
-                float *X_final, 
-                float *wte, 
-                float *logits, 
-                int BT, 
-                int C, 
-                int 
-                vocab_size, 
-                cudaStream_t stream)
+    float *X_final, 
+    float *wte, 
+    float *logits, 
+    int BT, 
+    int C, 
+    int vocab_size, 
+    cudaStream_t stream);
