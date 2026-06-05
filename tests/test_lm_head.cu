@@ -10,7 +10,7 @@ bool test_lm_head_v1() {
   cublasCreate(&cublas_handle);
   cudaStream_t stream;
   
-  float *X_final
+  float *X_final;
   float *wte;
   float *logits;
   float *logits_cpu;
@@ -44,11 +44,10 @@ bool test_lm_head_v1() {
   bool isExact = cuGPT::validate(logits, logits_cpu, B * T * vocab_size);
 
   // FREE MEMORY ALLOCATION
-  CUDA_CHECK(cudaFree(inputs));
-  CUDA_CHECK(cudaFree(out));
+  CUDA_CHECK(cudaFree(X_final));
   CUDA_CHECK(cudaFree(wte));
-  CUDA_CHECK(cudaFree(wpe));
-  std::free(out_cpu);
+  CUDA_CHECK(cudaFree(logits));
+  std::free(logits_cpu);
 
   // DESTROY STREAM
   cublasDestroy(cublas_handle);

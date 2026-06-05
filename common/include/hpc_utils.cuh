@@ -9,10 +9,8 @@
 #include <ctime>
 #include <unistd.h>
 #include <sys/time.h>
-
 #include <cuda_fp16.h>
-#include <nvcuda/wmma.h>
-using namespace nvcuda;
+
 
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
 
@@ -48,6 +46,8 @@ namespace cuGPT {
     void checkLast(const char* const file, const int line);
 
     void gemm(cublasHandle_t handle, float *A, float *B, float *C, int M, int N, int K);
+
+    void gemm_transposed(cublasHandle_t cublas_handle, float *A, float *B, float *C, int M, int N, int K);
 
     //
     // Overload Functions
