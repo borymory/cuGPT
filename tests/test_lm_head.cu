@@ -29,8 +29,10 @@ bool test_lm_head_v1() {
   CUDA_CHECK(cudaStreamCreate(&stream));
 
   // -- VERIFY KERNEL RUN --
+  std::printf("Initializing Matrices... | ");
   cuGPT::initMatrix(X_final, B*T, C);
   cuGPT::initMatrix(wte, vocab_size, C);
+  std::printf("✅\n");
 
   std::printf("Running CPU LM Head... | ");
   cpu_lm_head_fwd(X_final, wte, logits_cpu, B * T, C, vocab_size);
@@ -39,7 +41,7 @@ bool test_lm_head_v1() {
   std::printf("Running GPU LM Head... | ");
   lm_head_fwd(cublas_handle, X_final, wte, logits, B * T, C, vocab_size, stream);
   CUDA_CHECK(cudaDeviceSynchronize());
-  std::printf("✅ GPU Embedding LM Head\n");
+  std::printf("✅ GPU LM Head Finished\n");
 
   bool isExact = cuGPT::validate(logits, logits_cpu, B * T * vocab_size);
 

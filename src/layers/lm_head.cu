@@ -25,7 +25,7 @@ void cpu_lm_head_fwd(float *X_final, float *wte,
 // LM Head implementation
 //
 
-// X_final[BT, C], wte[vocab_size, C] (weight-tying), logits[BT, vocab_size]
+// X_final[BT, C], wte[vocab_size, C], logits[BT, vocab_size]
 void lm_head_fwd(cublasHandle_t cublas_handle, 
                 float *X_final, 
                 float *wte, 
@@ -39,7 +39,7 @@ void lm_head_fwd(cublasHandle_t cublas_handle,
 
     // X_final * wte^T
     // X_final [BT, C]
-    // wte^T   [C, vocab_size]
+    // wte  [vocab_size, C]
     cuGPT::gemm_transposed(cublas_handle, X_final, wte, logits, BT, vocab_size, C);
 
 }

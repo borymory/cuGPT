@@ -118,7 +118,7 @@ namespace cuGPT {
 
   // A: [M, K]
   // B^T: [K, N]
-  // C = A@B^T: [M, N]
+  // C = A@B^T: [M, N] // NOT WORKING
   void gemm_transposed(cublasHandle_t cublas_handle, float *A, float *B, float *C, int M, int N, int K) {
     float alpha = 1.0f;
     float beta = 0.0f;
@@ -126,7 +126,7 @@ namespace cuGPT {
     cublasStatus_t status = cublasSgemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
       N, M, K,
       &alpha,
-      B, N,
+      B, K,
       A, K,
       &beta,
       C, N);
