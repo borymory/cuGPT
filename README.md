@@ -22,11 +22,12 @@ The goal is understanding design considerations rather than reproducing existing
 
 ## **Implemented**
 
-- [x] Layernorm
+- [x] Layernorm 
 - [x] FeedForward Neural Network
 - [x] Token Embedding + Positional Embedding
-- [x] Online Softmax (with TOP-K)
-- [x] Logits Sampler
+- [x] Language Model Head
+- [x] Online Softmax (with TOP-K) **NOT TESTED**
+- [x] Logits Sampler **NOT TESTED**
 
 ## **In Progress**
 
@@ -46,9 +47,9 @@ git clone https://github.com/borymory/cuGPT.git
 ```
 cd cuGPT
 
-chmod +x scripts/test_build.sh
+chmod +x scripts/test_layer.sh
 
-./scripts/test_build.sh layernorm
+./scripts/test_layer.sh layernorm
 ```
 
 # **Roadmap**
