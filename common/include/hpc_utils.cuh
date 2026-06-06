@@ -45,8 +45,10 @@ namespace cuGPT {
 
     void checkLast(const char* const file, const int line);
 
+    // Inputs: A[M, K], B[K, N] | Operation: C = A@B
     void gemm(cublasHandle_t handle, float *A, float *B, float *C, int M, int N, int K);
 
+    // Inputs: A[M, K], B[N, K] | Operation: C = A@B^T
     void gemm_transposed(cublasHandle_t cublas_handle, float *A, float *B, float *C, int M, int N, int K);
 
     //

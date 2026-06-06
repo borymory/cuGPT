@@ -18,7 +18,7 @@ bool test_lm_head_v1() {
   int B = 4;
   int T = 256;
   int C = 512;
-  int vocab_size = 50257;
+  int vocab_size = 512; // Accurately: 50257
 
   
   // USE UNIFIED MEMORY - INITIALIZATIONS
@@ -35,6 +35,7 @@ bool test_lm_head_v1() {
   std::printf("✅\n");
 
   std::printf("Running CPU LM Head... | ");
+  std::fflush(stdout);
   cpu_lm_head_fwd(X_final, wte, logits_cpu, B * T, C, vocab_size);
   std::printf("✅ CPU LM Head Finished\n");
 

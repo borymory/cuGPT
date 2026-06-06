@@ -15,7 +15,7 @@ void cpu_lm_head_fwd(float *X_final, float *wte,
     int C, int vocab_size);
 
 
-// LM head implementations
+// LM head
 void lm_head_fwd(cublasHandle_t cublas_handle, 
     float *X_final, 
     float *wte, 

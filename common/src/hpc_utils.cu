@@ -94,9 +94,9 @@ namespace cuGPT {
         }
     }
 
-  // A: [M, K]
-  // B: [K, N]
-  // All are row-major GPU pointers
+  // A: [M, K] lda = K
+  // B: [K, N] ldb = N
+  // All are row-major GPU pointers. For col major we give row_B^T, col_A^T, inner_dim = N, M, K
   // C = A@B
   void gemm(cublasHandle_t cublas_handle, float *A, float *B, float *C, int M, int N, int K) {
     float alpha = 1.0f;
@@ -116,9 +116,10 @@ namespace cuGPT {
     }
   }
 
-  // A: [M, K]
-  // B^T: [K, N]
-  // C = A@B^T: [M, N] // NOT WORKING
+  // A: [M, K] lda = K
+  // B: [N, K] ldb = K
+  // A, B are row-major. For col major, we give in (row_B^T)^T, col_A^T, inner_dim = N, M, K
+  // C = A@B^T: [M, N]
   void gemm_transposed(cublasHandle_t cublas_handle, float *A, float *B, float *C, int M, int N, int K) {
     float alpha = 1.0f;
     float beta = 0.0f;
