@@ -1,5 +1,5 @@
 #!/bin/bash
-# Usage: ./scripts/test_build.sh <layer_name> (e.g., ./scripts/test_build.sh mlp)
+# Usage: ./scripts/test_layer.sh <layer_name> (e.g., ./scripts/test_build.sh mlp)
 
 LAYER=$1
 
