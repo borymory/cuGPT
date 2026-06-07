@@ -19,7 +19,7 @@ void online_softmax_topk_temp(
         printf("Invalid arguments: MAX_K > vocab_size!\n");
         return;
     }
-    const float T_inv = (T > 0.0f) ? (1.0f / T) : 1.0f;
+    const float T_inv = (temp > 0.0f) ? (1.0f / temp) : 1.0f;
     for (unsigned int batch_offset = 0; batch_offset < B; ++batch_offset) {
         float m = -INFINITY;
         float norm = 1.0f;
@@ -117,7 +117,7 @@ void sample_top_k_from_logits(
     const int vocab_size, 
     const float temp) 
 {
-    const int MAX_K = 5
-    online_softmax_topk<MAX_K>(logits, u, p, B, vocab_size, temp);
+    const int MAX_K = 5;
+    online_softmax_topk_temp<MAX_K>(logits, u, p, B, vocab_size, temp);
     sample_top_k_from_probs(u, p, next_tokens, B, MAX_K);
 }

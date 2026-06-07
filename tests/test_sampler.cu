@@ -1,32 +1,33 @@
 #include <cstdio>
 #include "hpc_utils.cuh"
-#include "lm_head.cuh"
+#include "sampler.cuh"
 
 // -- VERIFY FUNCTIONS --
 // For elements wise verification, use cuGPT::validate(...) func given in ./common/hpc_utils.cu
 
-void print_logits(float* logits, const int B, const int vocab_size) {
-  for (int b = 0; b < B; ++b) {
-    std::printf("Batch %b:\n", b);
-    const float* batch_logits = logits + b * vocab_size;
+void print_data(const float *data, const int num_elements, const int width) {
+  for (int i = 0; i < num_elements; ++i) {
+    int col = i % width;
+    int row = i / width;
 
-    std::printf("Logits: [");
-    for (int i = 0; i < vocab_size - 1; ++i) {
-      float val = batch_logits[i];
-      std::printf("%f, ", val);
+    if (col == 0) std::printf("Row %d: [", row);
+    if (col == width-1) {
+      std::printf("%f", data[i]);
+      std::printf("]\n");
+    } else {
+      std::printf("%f, ", data[i]);
     }
-    std::printf("%f]\n", batch_logits[vocab_size - 1]);
   }
 }
 
-void test_sampler_v1() {  
+bool test_generation_sampler_v1() {  
   float* logits;        // [B, vocab_size]
-  float* u              // [B, MAX_K]
-  int* p                // [B, MAX_K]
-  int* next_tokens      // [B]
+  float* u;             // [B, MAX_K]
+  int* p;               // [B, MAX_K]
+  int* next_tokens;     // [B]
 
   int B = 2;
-  int T = 1;  // For inference, generation phase
+  // T = 1 for inference (unused)
   int vocab_size = 20; // Accurately: 50257
   int MAX_K = 5;
   float temp = 0.1f;  // Almost greedy-decoding
@@ -43,7 +44,7 @@ void test_sampler_v1() {
     int num = i % vocab_size;
     logits[i] = (float)num + 0.1f;
   }
-  print_logits(logits, B, vocab_size);
+  print_data(logits, B * vocab_size, vocab_size);
 
   std::printf("Running CPU Softmax Sampling... | ");
   std::fflush(stdout);
@@ -52,15 +53,18 @@ void test_sampler_v1() {
     next_tokens, 
     B, vocab_size, temp);
   std::printf("✅\n");
+  print_data(next_tokens, B, B);
 
   // FREE MEMORY ALLOCATION
   std::free(logits);
   std::free(u);
   std::free(p);
   std::free(next_tokens);
+
+  return true;
 }
 
 int main(void) {
   std::printf("Running Test...\n");
-  if (test_lm_head_v1()) std::printf("It ran!\n");
+  if (test_generation_sampler_v1()) std::printf("It ran!\n");
 }
