@@ -19,7 +19,7 @@ void print_logits(float* logits, const int B, const int vocab_size) {
   }
 }
 
-bool test_sampler_v1() {  
+void test_sampler_v1() {  
   float* logits;        // [B, vocab_size]
   float* u              // [B, MAX_K]
   int* p                // [B, MAX_K]
@@ -39,7 +39,7 @@ bool test_sampler_v1() {
   next_tokens = (int*)std::malloc(B * sizeof(int));
 
   // -- Init Logits --
-  for (int i = 0; i < B * vocab_size) {
+  for (int i = 0; i < B * vocab_size; ++i) {
     int num = i % vocab_size;
     logits[i] = (float)num + 0.1f;
   }
@@ -58,10 +58,9 @@ bool test_sampler_v1() {
   std::free(u);
   std::free(p);
   std::free(next_tokens);
-
-  return isExact;
+}
 
 int main(void) {
   std::printf("Running Test...\n");
-  if (test_lm_head_v1()) std::printf("Succes!\n");
+  if (test_lm_head_v1()) std::printf("It ran!\n");
 }
