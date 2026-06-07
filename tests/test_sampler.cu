@@ -20,7 +20,22 @@ void print_data(const float *data, const int num_elements, const int width) {
   }
 }
 
-bool test_generation_sampler_v1() {  
+void print_intdata(const int *data, const int num_elements, const int width) {
+  for (int i = 0; i < num_elements; ++i) {
+    int col = i % width;
+    int row = i / width;
+
+    if (col == 0) std::printf("Row %d: [", row);
+    if (col == width-1) {
+      std::printf("%d", data[i]);
+      std::printf("]\n");
+    } else {
+      std::printf("%d, ", data[i]);
+    }
+  }
+}
+
+void test_generation_sampler_v1() {  
   float* logits;        // [B, vocab_size]
   float* u;             // [B, MAX_K]
   int* p;               // [B, MAX_K]
@@ -44,7 +59,6 @@ bool test_generation_sampler_v1() {
     int num = i % vocab_size;
     logits[i] = (float)num + 0.1f;
   }
-  print_data(logits, B * vocab_size, vocab_size);
 
   std::printf("Running CPU Softmax Sampling... | ");
   std::fflush(stdout);
@@ -53,18 +67,31 @@ bool test_generation_sampler_v1() {
     next_tokens, 
     B, vocab_size, temp);
   std::printf("✅\n");
-  print_data(next_tokens, B, B);
+  
+  printf("---------\n");
+  printf("RESULTS:\n");
+
+  std::printf("Logits:\n");
+  print_data(logits, B * vocab_size, vocab_size);
+
+  std::printf("u:\n");
+  print_data(u, B * MAX_K, MAX_K);
+  std::printf("p:\n");
+  print_intdata(p, B * MAX_K, MAX_K);
+
+  std::printf("Next tokens:\n");
+  print_intdata(next_tokens, B, B);
+  
+  printf("---------\n");
 
   // FREE MEMORY ALLOCATION
   std::free(logits);
   std::free(u);
   std::free(p);
   std::free(next_tokens);
-
-  return true;
 }
 
 int main(void) {
-  std::printf("Running Test...\n");
-  if (test_generation_sampler_v1()) std::printf("It ran!\n");
+  std::printf("Running unit test...\n");
+  test_generation_sampler_v1();
 }
