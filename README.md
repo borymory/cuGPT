@@ -61,6 +61,8 @@ chmod +x scripts/test_layer.sh
 ```
 cd cuGPT
 
+mkdir checkpoints
+
 chmod +x scripts/build_inference.sh
 
 ./scripts/build_inference.sh
