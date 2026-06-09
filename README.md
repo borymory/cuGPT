@@ -39,11 +39,14 @@ The goal is understanding design considerations rather than reproducing existing
 
 # **Quick Start**
 
-**Current development is concentrated at the layer level. E.g., to test a single layer:**
+**Current development is now at the inference main loop**
+
 
 ```
 git clone https://github.com/borymory/cuGPT.git
 ```
+
+**To test a single layer:**
 
 ```
 cd cuGPT
@@ -51,6 +54,16 @@ cd cuGPT
 chmod +x scripts/test_layer.sh
 
 ./scripts/test_layer.sh layernorm
+```
+
+**To build the inference loop:**
+
+```
+cd cuGPT
+
+chmod +x scripts/build_inference.sh
+
+./scripts/build_inference.sh
 ```
 
 # **Roadmap**

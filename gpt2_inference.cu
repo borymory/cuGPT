@@ -1,4 +1,4 @@
-#include "hpc_utils.cu"
+#include "hpc_utils.cuh"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -133,11 +133,11 @@ void calculate_buffer_size (size_t* param_size, model_config config) {
     param_size[LN_1_BETA_IDX] = (size_t)L * C;
 
     // ATTENTION proj_w_kqv, proj_b_kqv, proj_w_o, proj_b_o
-    for (TensorIndex tensor_idx = PROJ_W_Q_IDX; tensor_idx < PROJ_B_Q_IDX; ++tensor_idx) {
+    for (int tensor_idx = 4; tensor_idx < 7; ++tensor_idx) {
         param_size[tensor_idx] = (size_t)L * C * C;
     }
 
-    for (TensorIndex tensor_idx = PROJ_B_Q_IDX; tensor_idx < PROJ_W_O_IDX; ++tensor_idx) {
+    for (int tensor_idx = 7; tensor_idx < 10; ++tensor_idx) {
         param_size[tensor_idx] = (size_t)L * C;
     }
 
@@ -295,7 +295,7 @@ int main() {
 
     // infernece loop
 
-    free_model(&m);
+    free_model(&cuGPT);
 
     return 0;
 }
