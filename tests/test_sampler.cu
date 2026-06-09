@@ -18,6 +18,7 @@ void print_data(const float *data, const int num_elements, const int width) {
       std::printf("%f, ", data[i]);
     }
   }
+  std::printf("\n");
 }
 
 void print_intdata(const int *data, const int num_elements, const int width) {
@@ -33,6 +34,7 @@ void print_intdata(const int *data, const int num_elements, const int width) {
       std::printf("%d, ", data[i]);
     }
   }
+  std::printf("\n");
 }
 
 void test_generation_sampler_v1() {  
@@ -81,7 +83,7 @@ void test_generation_sampler_v1() {
 
   std::printf("Next tokens:\n");
   print_intdata(next_tokens, B, B);
-  
+
   printf("---------\n");
 
   // FREE MEMORY ALLOCATION

@@ -1,9 +1,8 @@
 #include "hpc_utils.cuh"
 #include "sampler.cuh"
 
-// Simple sampler implementation from NVIDIA paper
 
-// Generation Case: T==1 (if T!=1, use GPU Kernels!)
+
 // logits[B, vocab_size], top_k_probs[B, MAX_K], top_k_indices[B, MAX_K]
 // returns list of indices and respective probs for sampling the next token.
 template<const int MAX_K>
@@ -106,6 +105,36 @@ void sample_top_k_from_probs(
     }
 }
 
+//
+// GPU Kernels
+//
+
+template<const int MAX_K, const int block_B>
+__global__ void online_softmax_topk_temp_v1 (
+    const float *logits,    // [B, vocab_size]
+    float *top_k_probs,     // [B, MAX_K]
+    int *top_k_indices,     // [B, MAX_K]
+    const int B, 
+    const int vocab_size, 
+    const float temp)
+{
+    // Launch CEIL_DIV(B, block_B) many blocks
+    int rowIdx = blockIdx.x * block_B;
+    logits += rowIdx * vocab_size;
+
+    float u[MAX_K];
+    int p[MAX_K];
+
+    for (int idx = threadIdx.x; idx < vocab_size; idx += blockDim.x) {
+        //
+    }
+}
+
+//
+// Sampler Implementations
+//
+
+// PREFILL and DECODE
 // Input: logits[B, vocab_size]
 // Intermediate: u[B, MAX_K], p[B, MAX_K]
 // Output: next_tokens[B]
@@ -117,6 +146,8 @@ void sample_top_k_from_logits(
     const int vocab_size, 
     const float temp) 
 {
+    // Time based seed on std::rand for new sampling at every run
+    std::srand(static_cast<unsigned int>(std::time(nullptr)));
     const int MAX_K = 5;
     online_softmax_topk_temp<MAX_K>(logits, u, p, B, vocab_size, temp);
     sample_top_k_from_probs(u, p, next_tokens, B, MAX_K);
