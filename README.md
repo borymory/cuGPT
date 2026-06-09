@@ -22,19 +22,20 @@ The goal is understanding design considerations rather than reproducing existing
 
 ## **Implemented**
 
-- [x] Layernorm 
-- [x] FeedForward Neural Network
-- [x] Token Embedding + Positional Embedding
-- [x] Language Model Head
-- [x] Online Softmax (with TOP-K) **NOT TESTED**
-- [x] Logits Sampler **NOT TESTED**
+- [x] **GPU** Layernorm 
+- [x] **GPU** FeedForward Neural Network
+- [x] **GPU** Token Embedding 
+- [x] **GPU** Positional Embedding
+- [x] **GPU** Language Model Head
+- [x] **Main Inference Loop** Tensor Loader and Pointer Slicer
+- [x] **Main Inference Loop** Model Struct
 
 ## **In Progress**
 
-- [ ] Flash Attention + Causal Mask
-- [ ] Parameter Loading
-- [ ] Tensor Parameter Adressing
-- [ ] **Main Inference Loop**
+- [ ] **GPU** Online Softmax (with TOP-K)
+- [ ] **GPU** Logits Sampler
+- [ ] **GPU** Flash Attention + Causal Mask
+- [ ] **Main Inference Loop** Forward Pass
 
 # **Quick Start**
 
@@ -54,10 +55,11 @@ chmod +x scripts/test_layer.sh
 
 # **Roadmap**
 
-Inference:
-
-- [ ] GPT-2 forward pass
-    - [ ] KV-cache
+- [ ] Inference Loop
+  - [x] Weight Loader
+  - [x] Model Initializer
+  - [ ] Forward Pass Kernels
+  - [ ] KV Cache Implementation
 
 Future Direction:
 
