@@ -56,17 +56,24 @@ chmod +x scripts/test_layer.sh
 ./scripts/test_layer.sh layernorm
 ```
 
-**To build the inference loop:**
+**Currently using tiktoken for tokenization. Build gpt2_inference.cu and then run python to call the executable:**
 
 ```
 cd cuGPT
 
 mkdir checkpoints
 
+python ./scripts/export_gpt2.py
+```
+
+```
 chmod +x scripts/build_inference.sh
 
 ./scripts/build_inference.sh
+
+python ./generate.py
 ```
+
 
 # **Roadmap**
 

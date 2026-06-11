@@ -113,9 +113,31 @@ typedef struct {
     model_parameters d_weights; // sliced device weights
     KV_cache d_kv_cache;        // slices device KV cache
 
-    float *h_weights_base;      // base ptr to host side weights
-    float *d_weights_base;      // base ptr to device side weights
-    float *d_kv_cache_base;     // base ptr to device side KV cache
+    float* h_weights_base;      // base ptr to host side weights
+    float* d_weights_base;      // base ptr to device side weights
+    float* d_kv_cache_base;     // base ptr to device side KV cache
+
+    // tokenized inputs
+    int* h_prompt;
+    int* d_prompt;
+
+    void prompt(char* argv[], const int prompt_len) {
+
+        h_prompt = (int*)malloc(prompt_len * sizeof(int));
+        if (!h_prompt) {
+            fprintf(stderr, "Failed to allocate CPU memory for prompt tokens.\n");
+            exit(EXIT_FAILURE);
+        }
+
+        for (int i = 0; i < prompt_len; ++i) {
+            h_prompt[i] = atoi(argv[i+2]);
+        }
+
+        CUDA_CHECK(cudaMalloc((void**)&d_prompt, prompt_len * sizeof(int)));
+        CUDA_CHECK(cudaMemcpy(d_prompt, h_prompt, prompt_len * sizeof(int), cudaMemcpyHostToDevice));
+
+        fprintf(stderr, "Model Prompted. Prompt ptr located at: %p\n", (void*)d_prompt);
+    }
 } model;
 
 void calculate_buffer_size (size_t* param_size, model_config config) {
@@ -189,7 +211,7 @@ float* malloc_and_point_to_weights(size_t* param_size, model_parameters* params)
     return params_memory;
 }
 
-// Initializes the model
+// Initializes the model on GPU with weights loaded
 model init_model(model_config config, const char* checkpoint_path) {
     model m;
     m.config = config;
@@ -275,7 +297,7 @@ model init_model(model_config config, const char* checkpoint_path) {
     free(m.h_weights_base);
     m.h_weights_base = NULL;
 
-    printf("Model Initialized. GPU weight base: %p\n", (void*)m.d_weights_base);
+    fprintf(stderr, "Model Initialized. GPU weight base: %p\n", (void*)m.d_weights_base);
 
     return m;
 }
@@ -283,19 +305,43 @@ model init_model(model_config config, const char* checkpoint_path) {
 void free_model(model* m) {
     cudaFree(m->d_weights_base);    // free device side weights
     cudaFree(m->d_kv_cache_base);   // free device side KV cache
+    cudaFree(m->d_prompt);
+    free(m->h_prompt);
 }
 
 //
 // Main Inference Loop
 //
 
-int main() {
-    model_config GPT2Config = {1024, 1, 50257, 12, 12, 768};
-    model cuGPT = init_model(GPT2Config, "checkpoints/gpt2_124m.bin");
+int main(int argc, char* argv[]) {
+    // argc: argument count
+    // argv[0] = program name
+    // argv[1] = checkpoint path
+    // argv[2...] = token IDs
+
+    if (argc < 3) {
+        fprintf(stderr, "Error: Missing Arguments.\n");
+        fprintf(stderr, "Usage: %s <checkpoint_path> <token 1> <token 2> ...\n");
+        return EXIT_FAILURE;
+    }
+
+    // Init model
+    const char* checkpoint_path = argv[1]; // "checkpoints/gpt2_124m.bin"
+    model_config GPT2Config = {1024, 1, 50257, 12, 12, 768}; // batch = 1
+    model cuGPT = init_model(GPT2Config, checkpoint_path);
+
+    // Prompt model
+    int prompt_len = argc - 2;
+    cuGPT.prompt(argv, prompt_len);
+    
+    // Print prompt tokens
+    for (int i = 0; i < prompt_len; ++i) {
+        printf("%d ", cuGPT.h_prompt[i]);
+    }
+    fprintf(stderr, "\n");
 
     // infernece loop
 
     free_model(&cuGPT);
-
     return 0;
 }
