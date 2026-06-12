@@ -31,6 +31,63 @@ __global__ void embedding_v1(const int *inputs, float *out, const float *wte, co
     }
 }
 
+// Input: X[BT, C], X_norm[BT, C], alpha[C], beta[C]
+template<const int block_BT>
+__global__ void layernorm_fwd_v1(float *X, float *X_norm, float *alpha, float *beta, int BT, int C) {
+    // Launch CEIL_DIV(BT, block_BT) many blocks
+    // Launch block_BT * 32 many threads
+    const float eps = 1e-5f;    // to prevent divide by zero error
+
+    int tx = threadIdx.x % 32;
+    int ty = threadIdx.x / 32;
+
+    // offset blocks to rows
+    int rowIdx = blockIdx.x * block_BT;
+    X += rowIdx * C;
+    X_norm += rowIdx * C;
+
+    // Mean Calculation
+    float mean = 0.0f;
+    for (unsigned int i = 0; i < C; i += 32) {
+        int dIdx = tx + i;
+        // failsafe if C is not a multiple of 32
+        if (dIdx < C) {
+            mean += X[ty * C + dIdx];
+        }
+    }
+
+    for (unsigned int mirrorIdx = 1; mirrorIdx <= 16; mirrorIdx <<= 1) {
+        mean += __shfl_xor_sync(FULL_MASK, mean, mirrorIdx);
+    }
+    mean /= C;
+    
+    // Standard Deviation Calculation
+    float std_dev = 0.0f;
+    for (unsigned int i = 0; i < C; i += 32) {
+        int dIdx = tx + i;
+        // failsafe if C is not a multiple of 32
+        if (dIdx < C) {
+            float diff = X[ty * C + dIdx] - mean;
+            std_dev += diff * diff;
+        }
+    }
+
+    for (unsigned int mirrorIdx = 1; mirrorIdx <= 16; mirrorIdx <<= 1) {
+        std_dev += __shfl_xor_sync(FULL_MASK, std_dev, mirrorIdx);
+    }
+    std_dev = sqrtf((std_dev / C) + eps);
+
+    // Update and load to X_norm
+    for (unsigned int i = 0; i < C; i += 32) {
+        int dIdx = tx + i;
+        // failsafe if C is not a multiple of 32
+        if (dIdx < C) {
+            X_norm[ty * C + dIdx] = ((X[ty * C + dIdx] - mean) / std_dev) * alpha[dIdx] + beta[dIdx];
+        }
+    }
+
+}
+
 // Kernel Launchers
 void launch_embedding_v1(int *inputs, float *out, float *wte, float *wpe, int B, int T, int C, int max_length, cudaStream_t stream) {
     int total_elements = B * T * C;
@@ -39,6 +96,18 @@ void launch_embedding_v1(int *inputs, float *out, float *wte, float *wpe, int B,
     int block_count = CEIL_DIV(total_elements, thread_count);
 
     embedding_v1<<<block_count, thread_count, 0, stream>>>(inputs, out, wte, wpe, B, T, C, max_length);
+    CHECK_LAST_CUDA_ERROR();
+}
+
+void layernorm_forward_v1(float *X, float *X_norm, 
+                          float *alpha, float *beta, 
+                          int BT, int C, 
+                          cudaStream_t stream) {
+    const int block_BT = 32;
+    int block_count = CEIL_DIV(BT, block_BT);
+    int thread_count = block_BT * 32;
+
+    layernorm_fwd_v1<block_BT><<<block_count, thread_count, 0, stream>>> (X, X_norm, alpha, beta, BT, C);
     CHECK_LAST_CUDA_ERROR();
 }
 
@@ -58,6 +127,7 @@ typedef struct {
 
 typedef enum {
     EMBED_OUT_IDX = 0,
+    X_NORM_IDX,
 
     NUM_ACTIVATIONS
 } ActivationIndex;
@@ -133,7 +203,8 @@ typedef struct {
 } model_parameters;
 
 typedef struct {
-    float* embedding_out; // [B, T, C]
+    float* embedding_out; // [B, max_T, C]
+    float* X_norm;  // [B, max_T, C]
 } model_activations;
 
 typedef struct {
@@ -219,6 +290,8 @@ void calculate_param_buffer_size (size_t* param_size, model_config config) {
     param_size[LN_FINAL_BETA_IDX] = (size_t)C;
 }
 
+// keeping batch==1 for now. declaring max_T instead of current 
+// since model can progress to max_seq_len if <EOS> is never met...
 void calculate_activ_buffer_size (size_t* activ_size, model_config config) {
     int max_T = config.max_seq_len;
     int V = config.vocab_size;
@@ -226,6 +299,7 @@ void calculate_activ_buffer_size (size_t* activ_size, model_config config) {
     int C = config.channels;
 
     activ_size[EMBED_OUT_IDX] = (size_t)max_T * C;
+    activ_size[X_NORM_IDX] = (size_t)max_T * C;
     // populate activ_size array with further hidden activations
 }
 
@@ -275,7 +349,7 @@ float* malloc_and_point_to_activations(size_t* activ_size, model_activations* ac
 
     // array of adresses to model activ pointers
     float** ptrs[] = {
-        &activations->embedding_out // add more pointer adresses as more activations need to be sliced
+        &activations->embedding_out, &activations->X_norm // add more pointer adresses as more activations need to be sliced
     };
     int num_ptrs = sizeof(ptrs) / sizeof(ptrs[0]);
     if (num_ptrs != NUM_ACTIVATIONS) {
@@ -407,29 +481,36 @@ void prefill_forward(model* m, cudaStream_t stream) {
 
     // Preprocessing
     int* user_prompt = m->d_prompt;
-    float* hidden_embedding = m->d_activations.embedding_out; // of shape [BT, C]
+    float* embedding_out = m->d_activations.embedding_out; // [B, T, C]
     float* wte = m->d_weights.wte;
     float* wpe = m->d_weights.wpe;
-    launch_embedding_v1(user_prompt, hidden_embedding, wte, wpe, 1, current_seq_len, C, max_seq_len, stream);
+    launch_embedding_v1(user_prompt, embedding_out, wte, wpe, 1, current_seq_len, C, max_seq_len, stream);
 
-    // L-1 for proper layer offest indexology
-    for (int i = 0; i < L-1; ++i) {
-        // residual(x)
+    // Activations can be declared out of the loop,
+    // and can be overwritten at each layer:
+    float* X_norm = m->d_activations.X_norm;
 
-        // x = layernorm
+    // L-1 for proper layer offest indexology: 
+    for (int l = 0; l < L-1; ++l) {
+        // embedding_out is the current residual
+        float* alpha = m->d_weights.ln_1_alpha + l * C;
+        float* beta = m->d_weights.ln_1_beta + l * C;
+        layernorm_forward_v1(embedding_out, X_norm, alpha, beta, 1*current_seq_len, C, stream);
         // x = attn
 
-        // x' = x + residual(x)
+        // attn(x) = attn(x) + embedding_out (element wise)
 
-        // x = layernorm
-        // x = mlp
+        // x = layernorm (overwrite to X_norm)
+        // x = mlp (out: X_mlp)
 
-        // x = x + x'
+        // attn(x) = X_mlp + attn(x)
     }
 
     // x final layernorm
     // x softmax
     // x sampler
+    // increase current_seq_len by one!
+    // apped the new sampled idx to m->d_prompt by user_prompt and send this to decode_forward
 }
 
 //
