@@ -7,7 +7,7 @@ echo "🔨 Building Main Inference Loop"
 # common headers and .cu files
 nvcc -I./common/include \
      common/src/*.cu \
-     gpt2_inference.cu
+     gpt2_inference.cu \
      -lcublas \
      -o bin/gpt2_inference
 

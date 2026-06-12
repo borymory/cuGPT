@@ -14,10 +14,71 @@
 //
 // KERNELS
 //
+__global__ void embedding_v1(const int *inputs, float *out, const float *wte, const float *wpe, const int B, const int T, const int C, const int max_length) {
+    // View inputs and out as 1D
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = B * T * C;
+
+    // grid-stride loop
+    for (int idx = tid; idx < total_elements; idx += blockDim.x * gridDim.x) {
+        
+        int c_idx = idx % C;        // which channel in the token
+        int token_idx = idx / C;    // which token in the sequence
+        int token_id = inputs[token_idx];
+        int pos_idx = token_idx % T;
+
+        out[idx] = wte[token_id * C + c_idx] + wpe[pos_idx * C + c_idx];
+    }
+}
+
+// Kernel Launchers
+void launch_embedding_v1(int *inputs, float *out, float *wte, float *wpe, int B, int T, int C, int max_length, cudaStream_t stream) {
+    int total_elements = B * T * C;
+
+    int thread_count = 256;
+    int block_count = CEIL_DIV(total_elements, thread_count);
+
+    embedding_v1<<<block_count, thread_count, 0, stream>>>(inputs, out, wte, wpe, B, T, C, max_length);
+    CHECK_LAST_CUDA_ERROR();
+}
 
 //
-// Forward Pass
+// Forward Pass (B == 1) for now
 //
+void prefill_forward(model* m, cudaStream_t stream) {
+    int T = m->seq_len;
+    int C = m->config.channels;
+    int max_seq_len = m->config.max_seq_len;
+    int L = m->config.layers;
+
+    // Preprocessing
+    int* user_prompt = m->d_prompt;
+    float* hidden_embedding = m->d_activations.embedding_out; // of shape [BT, C]
+    float* wte = m->d_weights.wte;
+    float* wpe = m->d_weights.wpe;
+    launch_embedding_v1(user_prompt, hidden_embedding, wte, 1, seq_len, C, max_seq_len, stream);
+
+    // Layers 0-11
+    for (int i = 0; i < L; ++i) {
+        // residual(x)
+
+        // x = layernorm
+        // x = attn
+
+        // x' = x + residual(x)
+
+        // x = layernorm
+        // x = mlp
+
+        // x = x + x'
+    }
+
+    // x final layernorm
+    // x softmax
+    // x sampler
+
+    return;
+}
 
 //
 // MODEL DEFINITION
@@ -32,6 +93,12 @@ typedef struct {
     int32_t heads;
     int32_t channels;
 } file_header;
+
+typedef enum {
+    EMBED_OUT_IDX = 0,
+
+    NUM_ACTIVATIONS
+} ActivationIndex;
 
 typedef enum {
     WTE_IDX = 0,
@@ -104,26 +171,34 @@ typedef struct {
 } model_parameters;
 
 typedef struct {
+    float* embedding_out; // [B, T, C]
+} model_activations;
+
+typedef struct {
     float* key_cache;   // [L, max_B, H, max_T, d_head]
     float* value_cache; // [L, max_B, H, max_T, d_head]
 } KV_cache;
 
 typedef struct {
     model_config config;
+    model_activations d_activations;    // sliced device activations
     model_parameters d_weights; // sliced device weights
     KV_cache d_kv_cache;        // slices device KV cache
 
     float* h_weights_base;      // base ptr to host side weights
     float* d_weights_base;      // base ptr to device side weights
+    float* d_activations_base;  // base ptr to device side activations
     float* d_kv_cache_base;     // base ptr to device side KV cache
 
     // tokenized inputs
     int* h_prompt;
+    int seq_len;
     int* d_prompt;
 
     void prompt(char* argv[], const int prompt_len) {
-
-        h_prompt = (int*)malloc(prompt_len * sizeof(int));
+        m.seq_len = prompt_len;
+        size_t max_context_size = (size_t)config.max_seq_len * sizeof(int);
+        h_prompt = (int*)malloc(max_context_size);
         if (!h_prompt) {
             fprintf(stderr, "Failed to allocate CPU memory for prompt tokens.\n");
             exit(EXIT_FAILURE);
@@ -133,14 +208,14 @@ typedef struct {
             h_prompt[i] = atoi(argv[i+2]);
         }
 
-        CUDA_CHECK(cudaMalloc((void**)&d_prompt, prompt_len * sizeof(int)));
+        CUDA_CHECK(cudaMalloc((void**)&d_prompt, max_context_size));
         CUDA_CHECK(cudaMemcpy(d_prompt, h_prompt, prompt_len * sizeof(int), cudaMemcpyHostToDevice));
 
         fprintf(stderr, "Model Prompted. Prompt ptr located at: %p\n", (void*)d_prompt);
     }
 } model;
 
-void calculate_buffer_size (size_t* param_size, model_config config) {
+void calculate_param_buffer_size (size_t* param_size, model_config config) {
     int max_T = config.max_seq_len;
     int V = config.vocab_size;
     int L = config.layers;
@@ -182,8 +257,18 @@ void calculate_buffer_size (size_t* param_size, model_config config) {
     param_size[LN_FINAL_BETA_IDX] = (size_t)C;
 }
 
+void calculate_activ_buffer_size (size_t* activ_size, model_config config) {
+    int max_T = config.max_seq_len;
+    int V = config.vocab_size;
+    int L = config.layers;
+    int C = config.channels;
+
+    activ_size[EMBED_OUT_IDX] = (size_t)max_T * C;
+    // populate activ_size array with further hidden activations
+}
+
 // Implementation inspired from Andrej Karpathy's llm.c repo :)
-// Creates a base ptr to the GPU buffer and slices the GPU buffer to tensor parameters
+// Returns a base ptr to the GPU buffer and slices the GPU buffers to tensor parameters using model_parameters or model_activations
 float* malloc_and_point_to_weights(size_t* param_size, model_parameters* params) {
 
     size_t total_param_size = 0;
@@ -200,8 +285,13 @@ float* malloc_and_point_to_weights(size_t* param_size, model_parameters* params)
         &params->proj_b_k, &params->proj_b_v, &params->proj_w_o, &params->proj_b_o, &params->ln_2_alpha, &params->ln_2_beta, &params->ffn_w1, &params->ffn_b1,
         &params->ffn_w2, &params->ffn_b2, &params->ln_final_alpha, &params->ln_final_beta
     };
+    int num_ptrs = sizeof(ptrs) / sizeof(ptrs[0]);
+    if (num_ptrs != NUM_TENSORS) {
+        fprintf("Error: Mismatch in parameter tensor and pointer count! Tensor: %d, Ptr: %d\n", NUM_TENSORS, num_ptrs);
+        cudaFree(%params_memory);
+        exit(EXIT_FAILURE);
+    }
 
-    // Assign ptrs to correct tensor chunks on device
     float* base_offset = params_memory;
     for (size_t i = 0; i < NUM_TENSORS; ++i) {
         *(ptrs[i]) = base_offset;
@@ -211,17 +301,50 @@ float* malloc_and_point_to_weights(size_t* param_size, model_parameters* params)
     return params_memory;
 }
 
+float* malloc_and_point_to_activations(size_t* activ_size, model_activations* activations) {
+
+    size_t total_activ_size = 0;
+    for (size_t i = 0; i < NUM_ACTIVATIONS; ++i) {
+        total_activ_size += activ_size[i];
+    }
+
+    float* activs_memory;
+    CUDA_CHECK(cudaMalloc((void**)&activs_memory, total_activ_size * sizeof(float)));
+
+    // array of adresses to model activ pointers
+    float** ptrs[] = {
+        &activations->embedding_out // add more pointer adresses as more activations need to be sliced
+    };
+    int num_ptrs = sizeof(ptrs) / sizeof(ptrs[0]);
+    if (num_ptrs != NUM_ACTIVATIONS) {
+        fprintf("Error: Mismatch in activation and pointer count! Activ: %d, Ptr: %d\n", NUM_ACTIVATIONS, num_ptrs);
+        cudaFree(%activs_memory);
+        exit(EXIT_FAILURE);
+    }
+
+    float* base_offset = activs_memory;
+    for (size_t i = 0; i < NUM_ACTIVATIONS; ++i) {
+        *(ptrs[i]) = base_offset;
+        base_offset += activ_size[i];
+    }
+
+    return activs_memory;
+}
+
 // Initializes the model on GPU with weights loaded
 model init_model(model_config config, const char* checkpoint_path) {
     model m;
     m.config = config;
 
     // calculate the total memory needed for specific model
+    size_t activ_size[NUM_ACTIVATIONS];
     size_t param_size[NUM_TENSORS];
-    calculate_buffer_size(param_size, m.config);
+    calculate_param_buffer_size(param_size, m.config);
+    calculate_activ_buffer_size(activ_size, m.config);
 
-    // create GPU side buffer with correct weight ptrs and base ptr
+    // create GPU side buffer with correct weight/activation ptrs and base ptr
     m.d_weights_base = malloc_and_point_to_weights(param_size, &m.d_weights);
+    m.d_activations_base = malloc_and_point_to_activations(activ_size, &m.d_activations);
 
     // load weights onto CPU, then copy to GPU
     size_t total_elements = 0;
@@ -298,12 +421,14 @@ model init_model(model_config config, const char* checkpoint_path) {
     m.h_weights_base = NULL;
 
     fprintf(stderr, "Model Initialized. GPU weight base: %p\n", (void*)m.d_weights_base);
+    fprintf(stderr, "GPU activations base: %p\n", (void*)m.d_activations_base);
 
     return m;
 }
 
 void free_model(model* m) {
     cudaFree(m->d_weights_base);    // free device side weights
+    cudaFree(m->d_activations_base);    // free device side activations
     cudaFree(m->d_kv_cache_base);   // free device side KV cache
     cudaFree(m->d_prompt);
     free(m->h_prompt);
@@ -314,6 +439,8 @@ void free_model(model* m) {
 //
 
 int main(int argc, char* argv[]) {
+    cudastream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
     // argc: argument count
     // argv[0] = program name
     // argv[1] = checkpoint path
@@ -321,27 +448,34 @@ int main(int argc, char* argv[]) {
 
     if (argc < 3) {
         fprintf(stderr, "Error: Missing Arguments.\n");
-        fprintf(stderr, "Usage: %s <checkpoint_path> <token 1> <token 2> ...\n");
+        fprintf(stderr, "Usage: %s <checkpoint_path> <token 1> <token 2> ...\n", argv[0]);
         return EXIT_FAILURE;
     }
 
     // Init model
     const char* checkpoint_path = argv[1]; // "checkpoints/gpt2_124m.bin"
-    model_config GPT2Config = {1024, 1, 50257, 12, 12, 768}; // batch = 1
+    model_config GPT2Config = {1024, 1, 50257, 11, 11, 768}; // batch = 1
     model cuGPT = init_model(GPT2Config, checkpoint_path);
 
     // Prompt model
     int prompt_len = argc - 2;
     cuGPT.prompt(argv, prompt_len);
     
-    // Print prompt tokens
+    // Inference loop:
+
+    // Prefill Phase
+    prefill_forward(&cuGPT, stream);
+
+    // Decode Phase
+    // include check whether <EOS> token is reached
+
+    // Print last tokens
     for (int i = 0; i < prompt_len; ++i) {
         printf("%d ", cuGPT.h_prompt[i]);
     }
     fprintf(stderr, "\n");
 
-    // infernece loop
-
     free_model(&cuGPT);
+    CUDA_CHECK(cudaStreamDestroy(stream));
     return 0;
 }
