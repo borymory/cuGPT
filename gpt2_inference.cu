@@ -43,44 +43,6 @@ void launch_embedding_v1(int *inputs, float *out, float *wte, float *wpe, int B,
 }
 
 //
-// Forward Pass (B == 1) for now
-//
-void prefill_forward(model* m, cudaStream_t stream) {
-    int T = m->seq_len;
-    int C = m->config.channels;
-    int max_seq_len = m->config.max_seq_len;
-    int L = m->config.layers;
-
-    // Preprocessing
-    int* user_prompt = m->d_prompt;
-    float* hidden_embedding = m->d_activations.embedding_out; // of shape [BT, C]
-    float* wte = m->d_weights.wte;
-    float* wpe = m->d_weights.wpe;
-    launch_embedding_v1(user_prompt, hidden_embedding, wte, 1, seq_len, C, max_seq_len, stream);
-
-    // Layers 0-11
-    for (int i = 0; i < L; ++i) {
-        // residual(x)
-
-        // x = layernorm
-        // x = attn
-
-        // x' = x + residual(x)
-
-        // x = layernorm
-        // x = mlp
-
-        // x = x + x'
-    }
-
-    // x final layernorm
-    // x softmax
-    // x sampler
-
-    return;
-}
-
-//
 // MODEL DEFINITION
 //
 
@@ -192,11 +154,11 @@ typedef struct {
 
     // tokenized inputs
     int* h_prompt;
-    int seq_len;
+    int current_seq_len;
     int* d_prompt;
 
     void prompt(char* argv[], const int prompt_len) {
-        m.seq_len = prompt_len;
+        current_seq_len = prompt_len;
         size_t max_context_size = (size_t)config.max_seq_len * sizeof(int);
         h_prompt = (int*)malloc(max_context_size);
         if (!h_prompt) {
@@ -260,7 +222,7 @@ void calculate_param_buffer_size (size_t* param_size, model_config config) {
 void calculate_activ_buffer_size (size_t* activ_size, model_config config) {
     int max_T = config.max_seq_len;
     int V = config.vocab_size;
-    int L = config.layers;
+    int L = config.layers; // overwrite at each layer (seems possible)
     int C = config.channels;
 
     activ_size[EMBED_OUT_IDX] = (size_t)max_T * C;
@@ -287,8 +249,8 @@ float* malloc_and_point_to_weights(size_t* param_size, model_parameters* params)
     };
     int num_ptrs = sizeof(ptrs) / sizeof(ptrs[0]);
     if (num_ptrs != NUM_TENSORS) {
-        fprintf("Error: Mismatch in parameter tensor and pointer count! Tensor: %d, Ptr: %d\n", NUM_TENSORS, num_ptrs);
-        cudaFree(%params_memory);
+        fprintf(stderr, "Error: Mismatch in parameter tensor and pointer count! Tensor: %d, Ptr: %d\n", NUM_TENSORS, num_ptrs);
+        cudaFree(&params_memory);
         exit(EXIT_FAILURE);
     }
 
@@ -317,8 +279,8 @@ float* malloc_and_point_to_activations(size_t* activ_size, model_activations* ac
     };
     int num_ptrs = sizeof(ptrs) / sizeof(ptrs[0]);
     if (num_ptrs != NUM_ACTIVATIONS) {
-        fprintf("Error: Mismatch in activation and pointer count! Activ: %d, Ptr: %d\n", NUM_ACTIVATIONS, num_ptrs);
-        cudaFree(%activs_memory);
+        fprintf(stderr, "Error: Mismatch in activation and pointer count! Activ: %d, Ptr: %d\n", NUM_ACTIVATIONS, num_ptrs);
+        cudaFree(&activs_memory);
         exit(EXIT_FAILURE);
     }
 
@@ -375,7 +337,7 @@ model init_model(model_config config, const char* checkpoint_path) {
         exit(EXIT_FAILURE);
     }
 
-    if (header.layers != config.layers ||
+    if (header.layers != (config.layers) ||
         header.channels != config.channels ||
         header.vocab_size != config.vocab_size) {
         fprintf(stderr, "Error: Mismatch in model config!\n");
@@ -435,11 +397,47 @@ void free_model(model* m) {
 }
 
 //
+// Forward Pass (B == 1) for now
+//
+void prefill_forward(model* m, cudaStream_t stream) {
+    int current_seq_len = m->current_seq_len;
+    int C = m->config.channels;
+    int max_seq_len = m->config.max_seq_len;
+    int L = m->config.layers;
+
+    // Preprocessing
+    int* user_prompt = m->d_prompt;
+    float* hidden_embedding = m->d_activations.embedding_out; // of shape [BT, C]
+    float* wte = m->d_weights.wte;
+    float* wpe = m->d_weights.wpe;
+    launch_embedding_v1(user_prompt, hidden_embedding, wte, wpe, 1, current_seq_len, C, max_seq_len, stream);
+
+    // L-1 for proper layer offest indexology
+    for (int i = 0; i < L-1; ++i) {
+        // residual(x)
+
+        // x = layernorm
+        // x = attn
+
+        // x' = x + residual(x)
+
+        // x = layernorm
+        // x = mlp
+
+        // x = x + x'
+    }
+
+    // x final layernorm
+    // x softmax
+    // x sampler
+}
+
+//
 // Main Inference Loop
 //
 
 int main(int argc, char* argv[]) {
-    cudastream_t stream;
+    cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
     // argc: argument count
     // argv[0] = program name
@@ -454,7 +452,7 @@ int main(int argc, char* argv[]) {
 
     // Init model
     const char* checkpoint_path = argv[1]; // "checkpoints/gpt2_124m.bin"
-    model_config GPT2Config = {1024, 1, 50257, 11, 11, 768}; // batch = 1
+    model_config GPT2Config = {1024, 1, 50257, 12, 12, 768}; // batch = 1
     model cuGPT = init_model(GPT2Config, checkpoint_path);
 
     // Prompt model
@@ -473,7 +471,6 @@ int main(int argc, char* argv[]) {
     for (int i = 0; i < prompt_len; ++i) {
         printf("%d ", cuGPT.h_prompt[i]);
     }
-    fprintf(stderr, "\n");
 
     free_model(&cuGPT);
     CUDA_CHECK(cudaStreamDestroy(stream));
