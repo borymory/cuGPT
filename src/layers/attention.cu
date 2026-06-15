@@ -1,204 +1,227 @@
 #include "hpc_utils.cuh"
 #include "attention.cuh"
 
-//
-// Helper Funcs
-//
-__device__ __forceinline__ void online_softmax(float* __restrict__ s_S, 
-half * __restrict__ s_P,
-float* __restrict__ m_local,
-float* __restrict__ l_local,
-const int Br, 
-const int Bc,
-const int lds)
+// CPU Func
+void cpu_attention(
+    const float* Q, // Shape: [B, H, N, d]
+    const float* K, // Shape: [B, H, N, d]
+    const float* V, // Shape: [B, H, N, d]
+    float *S,       // Shape: [N, N] (scrap)
+    float *O,       // Shape: [B, H, N, d]
+    int B,
+    int H,
+    int N,
+    int d
+) 
 {
-    // we have 128 threads (4 warps)
-    // A warp works on 16 many rows.
-    int warp_id = threadIdx.x / 32;
-    float *s_warp = s_S + (warp_id * 16) * lds;
-    half *p_warp = s_P + (warp_id * 16) * lds;
+    float scale = 1.0f / sqrtf(d);
+    for (int b = 0; b < B; ++b) {
+        for (int h = 0; h < H; ++h) {
+            int offset = b * (H * N * d) + h * (N * d);
+            const float* Q_local = Q + offset;
+            const float* K_local = K + offset;
+            const float* V_local = V + offset;
+            float* O_local = O + offset;
 
-    for (int row_offset = 0; row_offset < 16; ++row_offset) {
-        s_warp += row_offset * lds;
-        float m_i = m[row_offset];
-        float d_i = l[row_offset];
-        // Reduce s_warp into reg
-        for (int i = threadIdx.x; i < Bc; i += 32) {
-            float m_old = m_i;
-            float val = s_warp[i]
-            if (val > m_i) {
-                m_i = val;
-                l_i = l_i * expf(m_old - m_i) + 1.0f;
-            } else {
-                l_i += expf(val - m_i);
+            // QK matmul: Q[N, d], K[N, d]
+            for (int q_row = 0; q_row < N; ++q_row) {
+                for (int k_row = 0; k_row < N; ++k_row) {
+                    float qk_sum = 0.0f;
+                    for (int k = 0; k < d; ++k) {
+                        qk_sum += Q_local[q_row * d + k] * K_local[k_row * d + k];
+                    }
+                    S[q_row * N + k_row] = qk_sum * scale;
+                }
+            }
+
+            // Online Softmax
+            for (int s_row = 0; s_row < N; ++s_row) {
+                float m = -INFINITY;
+                float l = 0.0f;
+
+                for (int k = 0; k < N; ++k) {
+                    float val = S[s_row * N + k];
+                    
+                    float m_prev = m;
+                    m = fmaxf(m, val);
+                    
+                    l *= expf(m_prev - m);
+                    l += expf(val - m);
+                }
+
+                for (int k = 0; k < N; ++k) {
+                    S[s_row * N + k] = expf(S[s_row * N + k] - m) / l;
+                }
+            }
+
+            // PV Matmul: P[N, N], V[N, d]
+            for (int p_row = 0; p_row < N; ++p_row) {
+                for (int v_col = 0; v_col < d; ++v_col) {
+                    float pv_sum = 0.0f;
+                    for (int k = 0; k < N; ++k) {
+                        pv_sum += S[p_row * N + k] * V_local[k * d + v_col];
+                    }
+                    O_local[p_row * d + v_col] = pv_sum;
+                }
             }
         }
-
-        for (unsigned int mirrorIdx = 1; mirrorIdx <= 16; mirrorIdx <<= 1) {
-            float m_j = __shfl_xor_sync(FULL_MASK, m_i, mirrorIdx);     // obtain m_j from another thread
-            float l_j = __shfl_xor_sync(FULL_MASK, l_i, mirrorIdx);     // obtain l_j from another thread
-
-            float m_old = m_i;
-            if (m_j > m_i) {
-                m_i = m_j;
-                l_i = l_i * expf(m_old - m_i) + l_j;
-            } else {
-                l_i = l_i + l_j * expf(m_j - m_i);
-            }
-        }
-
-        // Load to s_P as FP16
-        for (int i = threadIdx.x; i < Bc; i += 32) {
-            p_warp[i] = __float2half(expf(s_warp[i] - m_i));
-        }
-
-        // Update row result
-        m_local[row_offset] = m_i;
-        l_local[row_offset] = l_i;
     }
-
 }
 
 
-// GMEM->SMEM load helper with FP32->FP16 casting. Block stride loop, functional with only 1D blocks
+//
+// Helper Funcs
+//
+
+
+// GMEM->SMEM load helper with FP32->FP16 casting: UNUSED
 __device__ __forceinline__ void float2half_load_to_smem(half* __restrict__ shared_dst, 
     const float* __restrict__ global_src, 
     const int num_elements) 
 {
-    const int tid = threadIdx.x;
 
-    for (int i = tid; i < num_elements; i += blockDim.x) {
+    for (int i = threadIdx.x; i < num_elements; i += blockDim.x) {
         shared_dst[i] = __float2half(global_src[i]);
     }
 }
 
-__device__ __forceinline__ void tensor_tile_attention(const half* __restrict__ s_Q, 
-const half* __restrict__ s_K, 
-const half* __restrict__ s_V,
+// Assumes Row-Major layout
+__device__ __forceinline__ void fload_to_smem(float* __restrict__ shared_dst, 
+    const float* __restrict__ global_src,
+    const int num_elements,
+    int transpose, 
+    const int row_dim,
+    const int col_dim,
+    const int padding
+) 
+{
+    if (transpose) {
+        int ldsmem = row_dim + padding; // How many elements to get to the other row
+
+        for (int idx = threadIdx.x; idx < num_elements; idx += blockDim.x) {
+            int s_col = idx / col_dim;
+            int s_row = idx % col_dim;
+            int s_idx = s_row * ldsmem + s_col;
+            shared_dst[s_idx] = global_src[idx];    
+            // smem shape: [col_dim, row_dim + padding]
+        }
+    } else {
+        int ldsmem = col_dim + padding;
+
+        for (int idx = threadIdx.x; idx < num_elements; idx += blockDim.x) {
+            int s_col = idx % col_dim;
+            int s_row = idx / col_dim;
+            int s_idx = s_row * ldsmem + s_col;
+            shared_dst[s_idx] = global_src[idx];
+            // smem shape: [row_dim, col_dim + padding]
+        }
+    }
+}
+
+__device__ __forceinline__ void tile_attention(
+const float* __restrict__ s_Q, 
+const float* __restrict__ s_K, 
+const float* __restrict__ s_V,
 float* __restrict__ s_S, 
-half * __restrict__ s_P,
-float* __restrict__ m_local,
-float* __restrict__ l_local,
-float* __restrict__ m_old,
-float* __restrict__ l_old,
-wmma::fragment<wmma::accumulator, 16, 16, 16, float> (&o_frag)[4],
+float* __restrict__ m_i,
+float* __restrict__ l_i,
+float* __restrict__ m_prev,
+float* __restrict__ l_prev,
+float* __restrict__ thread_res_O,
 const float scale, 
 const int d,
 const int Br,
-const int Bc)
+const int Bc,
+const int ELEMENTS_PER_ROW,
+int warpLane,
+int warpId,
+int warp_count)
 {   
-    int warp_id = threadIdx.x / 32; // Ranges [0, 3]
+    // QK Matmul: Q [Br, d], K^T [d, Bc]
+    for (int idx = threadIdx.x; idx < Br * Bc; idx += blockDim.x) {
+        int tCol = idx % Bc;    // 0 to Bc-1
+        int tRow = idx / Bc;    // 0 to Br-1
 
-    const int lda = d;  // s_Q is [Br, d]
-    const int ldb = d;  // s_K is [Bc, d]
-    const int lds = Bc;  // s_S is [Br, Bc]
-
-    half* q_warp = const_cast<half>(s_Q) + (warp_id * 16) * lda;
-    half* k_warp = const_cast<half>(s_K);
-    float* s_warp = s_S + (warp_id * 16) * lds;
-
-    // Declare fragments
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> q_frag;
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> k_frag;
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> s_frag;
-
-    // Compute QK^T
-    #pragma unroll
-    for (int col_step = 0; col_step < Bc; col_step += 16) {
-
-        wmma::fill_fragment(s_frag, 0.0f);
-
-        // Loop over dimension d in tiles
-        #pragma unroll
-        for (int k = 0; k < d; k += 16) {
-            // Load 16x16 tiles into respective fragments
-            half* q_tile = q_warp + k;
-            wmma::load_matrix_sync(q_frag, q_tile, lda);
-
-            half* k_tile = k_warp + col_step * ldb + k;
-            wmma::load_matrix_sync(k_frag, k_tile, ldb);
-
-            // Accumulate s_frag += q_frag * k_frag
-            wmma::mma_sync(s_frag, q_frag, k_frag, s_frag);
+        float qk_sum = 0.0f;
+        for (int k = 0; k < d; ++k) {
+            float q_val = s_Q[tRow * (d+1) + k];
+            float k_val = s_K[k * (Bc+1) + tCol];
+            qk_sum += q_val * k_val;
         }
-
-        // Load 16x16 result back to SMEM
-        float* s_tile = s_warp + col_step;
-        wmma::store_matrix_sync(s_tile, s_frag, lds, wmma:layout_row_major);
+        s_S[tRow * (Bc+1) + tCol] = qk_sum * scale;
     }
-
-    // This fills m_local and l_local, and updates s_P in FP16
-    online_softmax(s_S, s_P, m_local, l_local, Br, Bc, lds);
     __syncthreads();
 
-    // Calculate new global stats
-    float m_new[16];
-    #pragma unroll
-    for (int r = 0; r < 16; ++r) {
-        m_new[r] = fmaxf(m_old[r], m_local[r]);
-    }
+    // Online Softmax: Tiling S and calculating O values
+    int warp_row_idx = 0;
+    for (int warp_row = warpId; warp_row < Br; warp_row += warp_count) {    
+        // Reduce s_S into registers, doing statistics
+        for (int idx = warpLane; warpLane < Bc; idx += 32) {
+            float val = s_S[warp_row * (Bc+1) + idx];
 
-    // Update previous O accumulators in registers
-    int lane_id = threadIdx.x % 32;
-    #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        int tile_row = (lane_id % 4) * 2 + (i / 4) + (lane_id >= 16 ? 8 : 0);
+            float m_old = m_i[warp_row_idx];     // store old local max
+            m_i[warp_row_idx] = fmaxf(m_i[warp_row_idx], val);    // obtain new local max
 
-        // Previous block scale factor
-        float scale_factor = expf(m_old[tile_row] - m_new[tile_row]);
-
-        #pragma unroll
-        for (int o_col = 0; o_col < 4; ++o_col) {
-            o_frag[o_col].x[i] *= scale_factor;
+            l_i[warp_row_idx] *= expf(m_old - m_i[warp_row_idx]); // scale old norm
+            l_i[warp_row_idx] += expf(val - m_i[warp_row_idx]);   // add current contribution
         }
-    }
 
-    // PV Matmul
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> p_frag;
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> v_frag;
+        // Warp shuffle online softmax
+        for (unsigned int mirrorIdx = 1; mirrorIdx <= 16; mirrorIdx <<= 1) {
+            float m_j = __shfl_xor_sync(FULL_MASK, m_i[warp_row_idx], mirrorIdx);     // obtain m_j from another thread
+            float l_j = __shfl_xor_sync(FULL_MASK, l_i[warp_row_idx], mirrorIdx);     // obtain l_j from another thread
 
-    half* p_warp = s_P + (warp_id * 16) * Bc;
-    half* v_warp = const_cast<half>(s_V);
+            float max = fmaxf(m_i[warp_row_idx], m_j);    // max = max(m_i, m_j)
 
-    #pragma unroll
-    for (int k_step = 0; k_step < Bc; k_step += 16) {
-        half* p_tile = p_warp + k_step;
-        wmma::load_matrix_sync(p_frag, p_tile, Bc);
-
-        #pragma unroll
-        for (int o_col = 0; o_col < 4; ++o_col) {
-            half* v_tile = v_warp + k_step * d + (o_col * 16);
-            wmma::load_matrix_sync(v_frag, v_tile, d);
-
-            // Accumulate onto scaled o_frag
-            wmma::mma_sync(o_frag[o_col], p_frag, v_frag, o_frag[o_col]);
+            l_i[warp_row_idx] *= expf(m_i[warp_row_idx] - max);    // rescale old sum
+            l_i[warp_row_idx] += l_j * expf(m_j - max);       // add contribution from the new sum
+            m_i[warp_row_idx] = max;                 // store new max
         }
+
+        // Calculate unnorm P
+        for (int idx = warpLane; warpLane < Bc; idx += 32) {
+            s_S[warp_row * (Bc+1) + idx] = expf(s_S[warp_row * (Bc+1) + idx] - m_i[warp_row_idx]);
+        }
+        __syncthreads();
+
+        // Calculate global stats - store the new stats
+        float m_new = fmaxf(m_prev[warp_row_idx], m_i[warp_row_idx]);
+        float prev_scale = expf(m_prev[warp_row_idx] - m_new);
+        float current_scale = expf(m_i[warp_row_idx] - m_new);
+        m_prev[warp_row_idx] = m_new;
+        l_prev[warp_row_idx] = prev_scale * l_prev[warp_row_idx] + current_scale * l_i[warp_row_idx];
+
+        // PV Matmul: P [Br, Bc], V [Bc, d]
+        int o_col_idx = 0;
+        for (int idx = warpLane; warpLane < d; warpLane += 32) {
+            float pv_sum = 0.0f;
+            for (int k = 0; k < Bc; ++k) {
+                float p_val = s_S[warp_row * (Bc+1) + k];
+                float v_val = s_V[k * (d+1) + warpLane];
+                pv_sum += p_val * s_val;
+            }
+            thread_res_O[warp_row_idx * ELEMENTS_PER_ROW + o_col_idx] *= prev_scale;   // scale prev O chunk
+            pv_sum *= current_scale;    // scale pv_sum w.r.t. global stats
+            thread_res_O[warp_row_idx * ROWS_PER_WARP + o_col_idx] += pv_sum;   // add current PV chunk
+            o_col_idx += 1;
+        }
+
+        warp_row_idx += 1;
     }
-
-    // Store new stats as old
-    #pragma unroll
-    for (int r = 0; r < 16; ++r) {
-        float scale_old = expf(m_old[r] - m_local[r]);
-        float scale_local = expf(m_local[r] - m_new[r]);
-
-        l_old[r] = l_old[r] * scale_old + l_local[r] * scale_local;
-        m_old[r] = m_new[r];
-    }
-
 }
 
 //
 // GPU Kernel
 //
 
-// Assert Br/(blockDim.x/32) = 16 for Maximum FP16 Tensor utilization
-// Assert H*d = C
-// d = 64, H = 12 for GPT-2, C = 768
-// gridDim.x = C/d
+// For GPT2: d = 64, H = 12, C = 768
+// gridDim.x = H
 // gridDim.y = B
-// BlockDim.x = 128
+// BlockDim.x = 256
 // Br, Bc = 64
-template<const int Br, const int Bc>
+// Register of thread elements per row of O = d / 32.
+// Number of rows of a warp = Br / warp_count.
+template<const int Br, const int Bc, const int ELEMENTS_PER_ROW, const int ROWS_PER_WARP>
 __global__ void flash_attn_forward_kernel(
     const float* __restrict__ Q, // Shape: [B, H, N, d]
     const float* __restrict__ K, // Shape: [B, H, N, d]
@@ -223,112 +246,134 @@ __global__ void flash_attn_forward_kernel(
     float *O_local = O + block_offset;
 
     // Shared Memory
-    extern __shared__ half s_mem[];
-    half* s_Q = s_mem;         // Size Br * d
-    half* s_K = s_Q + Br * d;  // Size Bc * d
-    half* s_V = s_K + Bc * d;  // Size Bc * d
-    half* s_P = s_V + Bc * d;  // Size Br * Bc
-    float* s_S = reinetpret_cast<float>(s_P + Br * Bc); // Size Br * Bc
+    extern __shared__ float s_mem[];
+    float* s_Q = s_mem;         // Size Br * (d + 1)
+    float* s_K = s_Q + Br * (d + 1);  // Size d * (Bc + 1)
+    float* s_V = s_K + d * (Bc + 1);  // Size Bc * (d + 1)
+    float* s_S = s_V + Bc * (d + 1);  // Size Br * (Bc + 1)
 
-    int warp_id = threadIdx.x / 32;
-    int lane_id = threadIdx.x % 32;
+    // 1/sqrt(d) from the attention paper
     const float scale = 1.0f / sqrtf(d);
 
-    // Running Statistics
-    float m_local[16];
-    float l_local[16];
-    float m_old[16];
-    float l_old[16];
+    // Thread Specific data
+    float m_prev[ROWS_PER_WARP];
+    float l_prev[ROWS_PER_WARP];
+    float m_i[ROWS_PER_WARP];
+    float l_i[ROWS_PER_WARP];
+    float thread_res_O[ROWS_PER_WARP * ELEMENTS_PER_ROW];
+                // Check mapping: if you want to use warp shuffle for softmax
+                // you need ind. warps working on ind. rows of s_S. 
+                // Thus, a single warp works on multiple rows of s_S,
+                // and thus responsible for multiple rows of O.
+                // Equals, more register allocation both for statistics, and for
+                // the O output.
+                // Napkin math: 256 threads per block (8 warps).
+                // Meaning (Br)64/8 = 8 rows. (d)64 col / 32 thread = 2 registers per row.
+                // Thus a single thread in a warp has 8*2=16 registers. 256*16 = 4096 reg per block.
+                // Tesla T4: reg per SM:65536. my kernel: 4096 reg per block.
+                // 65536 / 4096 = 16 block per SM. Realistically,
+                // it will be less than 16, accounting for statistics registers...
+                // Max block per SM is 16, so this is a reasonable decision.
+    int warpLane = threadIdx.x % 32;    // 0 to 31
+    int warpId = threadIdx.x / 32;  // 0 to 7
+    int warp_count = blockDim.x / 32; // 8
     
     // Outer Loop over Q and O
     for (unsigned int i = 0; i < N; i += Br) {
 
-        // Initialize running statistics for Q_i block
-        for (int r = 0; r < 16; r++) {
-            m_old[r] = -INFINITY;
-            l_old[r] = 0.0f;
-        } 
-
-        // Initialize o_frag accumulator fragments in registers
-        wmma::fragment<wmma::accumulator, 16, 16, 16, float> o_frag[4];
-        #pragma unroll
-        for(int col = 0; col < 4; ++col) {
-            wmma::fill_fragments(o_frag[col], 0.0f);
-        }
-
-
-        // Populate s_Q
-        float2half_load_to_smem(s_Q, Q_local + i * d, Br * d);
-        __syncthreads();
-
-        // Inner Loop over K and V
-        for (unsigned int j = 0; j < N; j += Bc) {
-
-            // Populate rest smem
-            float2half_load_to_smem(s_K, K_local + j * d, Bc * d);
-            float2half_load_to_smem(s_V, V_local + j * d, Bc * d);
-            __syncthreads();
-
-            // Attention Tile: Scales O_frag and adds current PV contribution
-            tensor_tile_attention(
-                s_Q, s_K, s_V, s_S, s_P,
-                m_local, l_local, m_old, l_old,
-                o_frag, scale, d, Br, Bc
-            );
-            __syncthreads();
-        }
-
-        // Normalize O registers
-        #pragma unroll
-        for (int k = 0; k < 8; ++k) {
-            int tile_row = (lane_id % 4) * 2 + (k / 4) + (lane_id >= 16 ? 8 : 0);
-
-            float inv_l = 1.0f / l_old[tile_row];
-
-            #pragma unroll
-            for (int o_col = 0; o_col < 4; ++o_col) {
-                o_frag[o_col].x[k] *= inv_l;
+        // Initialize running statistics and registers for Q_i block
+        for (int r = 0; r < ROWS_PER_WARP; ++r) {
+            m_prev[i] = -INFINITY;
+            l_prev[i] = 0.0f;
+            m_i[i] = -INFINITY;
+            l_i[i] = 0.0f;
+            for (int c = 0; c < ELEMENTS_PER_ROW; ++c){
+                thread_res_O[r * ELEMENTS_PER_ROW + c] = 0.0f;
             }
         }
 
-        // Store output registers to s_S as buffer
-        #pragma unroll
-        for (int o_col = 0; o_col < 4; ++o_col) {
-            float* s_out_tile = s_S + (warp_id * 16) * d + (o_col * 16);
-            wmma::store_matrix_sync(s_out_tile, o_frag[o_col], d, wmma::layout_row_major);
-        }
+        // Populate s_Q
+        fload_to_smem(s_Q, Q_local + i * d, Br * d, 0, Br, d, 1);
         __syncthreads();
 
-        // Copy finalized O output from buffer to Global Memory o
-        int total_elements = Br * d;
-        #pragma unroll
-        for (int idx = threadIdx.x; idx < total_elements; idx += blockDim.x) {
-            (O_local + i * d)[idx] = s_S[idx];
+        // Inner Loop over K and V: 
+        // Populates m_prev, l_prev with final softmax and thread_res_O register
+        // cache with the final O chunk values
+        for (unsigned int j = 0; j < N; j += Bc) {
+
+            // Populate rest smem: transpose K
+            fload_to_smem(s_K, K_local + j * d, Bc * d, 1, Bc, d, 1);
+            fload_to_smem(s_V, V_local + j * d, Bc * d, 0, Bc, d, 1);
+            __syncthreads();
+
+            // QK matmul, softmax, PV matmul
+            tile_attention(
+                s_Q, s_K, s_V, s_S,
+                m_i, l_i,
+                m_prev, l_prev,
+                thread_res_O,
+                scale, d,
+                Br, Bc, ELEMENTS_PER_ROW,
+                warpLane, warpId, warp_count
+            );
+
+            __syncthreads();
         }
-        __syncthreads();
+
+
+        // load final output from registers to GMEM
+        int warp_row_idx = 0;
+        float* O_block = O_local + i * d;
+        for (int warp_row = warpId; warp_row < Br; warp_row += warp_count) {
+            
+            float inv_l = 1/l_prev[warp_row_idx];
+            int o_col_idx = 0;
+            for (int idx = warpLane; warpLane < d; warpLane += 32) {
+
+                O_block[warp_row * d + idx] = inv_l * thread_res_O[warp_row_idx * ELEMENTS_PER_ROW + o_col_idx];
+                o_col_idx += 1;
+            }
+
+            warp_row_idx += 1;
+        }
     }
 }
 
 //
 // Kernel Wrappers
 //
-void flash_attn_forward(const float* __restrict__ Q, // Shape: [B, H, N, d]
+void launch_flash_attn_forward_kernel(
+    const float* __restrict__ Q, // Shape: [B, H, N, d]
     const float* __restrict__ K, // Shape: [B, H, N, d]
     const float* __restrict__ V, // Shape: [B, H, N, d]
     float* __restrict__ O,       // Shape: [B, H, N, d]
     const int B,
-    const int T,                 // Same as N
-    const int C,
     const int H,
-    cudaStream_t stream)
+    const int N,                 // Same as sequence length
+    const int d,
+    cudaStream_t stream
+)
 {
-    const int d = CEIL_DIV(C, H);
-    int grid_y = B;
-    int grid_x = H;
+    dim3 gridDim(H, B);
+    dim3 blockDim(256);
+    const int warp_count = 256 / 32;
+    const int Br = 64;
+    const int Bc = 64;
+    const int ROWS_PER_WARP = Br / warp_count;
 
-    dim3 blockDim(128);;
-    dim3 gridDim(grid_x, grid_y);
+    size_t shared_mem_bytes = (size_t)Br * (d + 1); // Padding for s_Q
+    shared_mem_bytes += (size_t)d * (Bc+1);         // Padding for s_K: TRANPOSED
+    shared_mem_bytes += (size_t)Bc * (d + 1);       // Padding for s_V
+    shared_mem_bytes += (size_t)Br * (Bc + 1);      // Padding for s_S
+    shared_mem_bytes *= sizeof(float);
 
-    flash_attn_forward_kernel<gridDim, blockDim, 0, stream>(K, Q, V, O, H, T, d);
-    CHECK_LAST_CUDA_ERROR();
+    switch (d) {
+        case 64: // GPT2 Case
+            flash_attn_forward_kernel<Br, Bc, 2, ROWS_PER_WARP><<<gridDim, blockDim, shared_mem_bytes, stream>>>(Q, K, V, O, H, N, d);
+            CHECK_LAST_CUDA_ERROR();
+            break;
+        default:
+            fprintf(stderr, "FlashAttn ERROR: No given d case is found: d=%d\n", d);
+            exit(EXIT_FAILURE);
+    }
 }
