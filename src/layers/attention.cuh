@@ -28,6 +28,7 @@ void launch_flash_attn_forward_kernel(
     const float* __restrict__ K, // Shape: [B, H, N, d]
     const float* __restrict__ V, // Shape: [B, H, N, d]
     float* __restrict__ O,       // Shape: [B, H, N, d]
+    const int B,
     const int H,
     const int N,                 // Same as sequence length
     const int d,

@@ -154,9 +154,10 @@ int warp_count)
 
     // Online Softmax: Tiling S and calculating O values
     int warp_row_idx = 0;
-    for (int warp_row = warpId; warp_row < Br; warp_row += warp_count) {    
+    for (int warp_row = warpId; warp_row < Br; warp_row += warp_count) {
+        
         // Reduce s_S into registers, doing statistics
-        for (int idx = warpLane; warpLane < Bc; idx += 32) {
+        for (int idx = warpLane; idx < Bc; idx += 32) {
             float val = s_S[warp_row * (Bc+1) + idx];
 
             float m_old = m_i[warp_row_idx];     // store old local max
@@ -179,10 +180,10 @@ int warp_count)
         }
 
         // Calculate unnorm P
-        for (int idx = warpLane; warpLane < Bc; idx += 32) {
+        for (int idx = warpLane; idx < Bc; idx += 32) {
             s_S[warp_row * (Bc+1) + idx] = expf(s_S[warp_row * (Bc+1) + idx] - m_i[warp_row_idx]);
         }
-        __syncthreads();
+        __syncwarp();
 
         // Calculate global stats - store the new stats
         float m_new = fmaxf(m_prev[warp_row_idx], m_i[warp_row_idx]);
@@ -193,16 +194,16 @@ int warp_count)
 
         // PV Matmul: P [Br, Bc], V [Bc, d]
         int o_col_idx = 0;
-        for (int idx = warpLane; warpLane < d; warpLane += 32) {
+        for (int idx = warpLane; idx < d; idx += 32) {
             float pv_sum = 0.0f;
             for (int k = 0; k < Bc; ++k) {
                 float p_val = s_S[warp_row * (Bc+1) + k];
-                float v_val = s_V[k * (d+1) + warpLane];
-                pv_sum += p_val * s_val;
+                float v_val = s_V[k * (d+1) + idx];
+                pv_sum += p_val * v_val;
             }
             thread_res_O[warp_row_idx * ELEMENTS_PER_ROW + o_col_idx] *= prev_scale;   // scale prev O chunk
             pv_sum *= current_scale;    // scale pv_sum w.r.t. global stats
-            thread_res_O[warp_row_idx * ROWS_PER_WARP + o_col_idx] += pv_sum;   // add current PV chunk
+            thread_res_O[warp_row_idx * ELEMENTS_PER_ROW + o_col_idx] += pv_sum;   // add current PV chunk
             o_col_idx += 1;
         }
 
@@ -283,10 +284,10 @@ __global__ void flash_attn_forward_kernel(
 
         // Initialize running statistics and registers for Q_i block
         for (int r = 0; r < ROWS_PER_WARP; ++r) {
-            m_prev[i] = -INFINITY;
-            l_prev[i] = 0.0f;
-            m_i[i] = -INFINITY;
-            l_i[i] = 0.0f;
+            m_prev[r] = -INFINITY;
+            l_prev[r] = 0.0f;
+            m_i[r] = -INFINITY;
+            l_i[r] = 0.0f;
             for (int c = 0; c < ELEMENTS_PER_ROW; ++c){
                 thread_res_O[r * ELEMENTS_PER_ROW + c] = 0.0f;
             }
@@ -328,7 +329,7 @@ __global__ void flash_attn_forward_kernel(
             
             float inv_l = 1/l_prev[warp_row_idx];
             int o_col_idx = 0;
-            for (int idx = warpLane; warpLane < d; warpLane += 32) {
+            for (int idx = warpLane; idx < d; idx += 32) {
 
                 O_block[warp_row * d + idx] = inv_l * thread_res_O[warp_row_idx * ELEMENTS_PER_ROW + o_col_idx];
                 o_col_idx += 1;

@@ -24,7 +24,7 @@ bool test_flashattn_fwd() {
   size_t tensor_size = B * H * seq_len * d;
   size_t scratch_size = seq_len * seq_len;
 
-  size_t tensor_size_bytes = tensor_size * sizeof(float)
+  size_t tensor_size_bytes = tensor_size * sizeof(float);
   size_t scratch_size_bytes = scratch_size * sizeof(float);
 
   // Memory Allocation
@@ -46,7 +46,7 @@ bool test_flashattn_fwd() {
   cpu_attention(Q, K, V, S_cpu, O_cpu, B, H, seq_len, d);
   fprintf(stderr, "DONE!\n");
   fprintf(stderr, "Running GPU_FLASHATTN_FWD: ");
-  launch_flash_attn_forward_kernel(Q, K, V, O, H, seq_len, d, stream);
+  launch_flash_attn_forward_kernel(Q, K, V, O, B, H, seq_len, d, stream);
   fprintf(stderr, "DONE!\n");
   CUDA_CHECK(cudaDeviceSynchronize());
   bool isExact = cuGPT::validate(O, O_cpu, tensor_size);
