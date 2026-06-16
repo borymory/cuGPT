@@ -222,7 +222,7 @@ int warp_count)
 // Br, Bc = 64
 // Register of thread elements per row of O = d / 32.
 // Number of rows of a warp = Br / warp_count.
-template<const int Br, const int Bc, const int ELEMENTS_PER_ROW, const int ROWS_PER_WARP>
+template<const int ELEMENTS_PER_ROW, const int ROWS_PER_WARP>
 __global__ void flash_attn_forward_kernel(
     const float* __restrict__ Q, // Shape: [B, H, N, d]
     const float* __restrict__ K, // Shape: [B, H, N, d]
@@ -230,7 +230,9 @@ __global__ void flash_attn_forward_kernel(
     float* __restrict__ O,       // Shape: [B, H, N, d]
     const int H,
     const int N,                 // Same as sequence length
-    const int d
+    const int d,
+    const int Br,
+    const int Bc
 ) {
     int head_idx = blockIdx.x;
     int batch_idx = blockIdx.y;
@@ -358,8 +360,15 @@ void launch_flash_attn_forward_kernel(
     dim3 gridDim(H, B);
     dim3 blockDim(256);
     const int warp_count = 256 / 32;
-    const int Br = 64;
-    const int Bc = 64;
+    int Br;
+    int Bc;
+    if (Br < N) {
+        Br = 32;
+        Bc = 32;
+    } else {
+        Br = N;
+        Bc = N;
+    }
     const int ROWS_PER_WARP = Br / warp_count;
 
     size_t shared_mem_bytes = (size_t)Br * (d + 1); // Padding for s_Q
@@ -370,7 +379,7 @@ void launch_flash_attn_forward_kernel(
 
     switch (d) {
         case 64: // GPT2 Case
-            flash_attn_forward_kernel<Br, Bc, 2, ROWS_PER_WARP><<<gridDim, blockDim, shared_mem_bytes, stream>>>(Q, K, V, O, H, N, d);
+            flash_attn_forward_kernel<2, ROWS_PER_WARP><<<gridDim, blockDim, shared_mem_bytes, stream>>>(Q, K, V, O, H, N, d, Br, Bc);
             CHECK_LAST_CUDA_ERROR();
             break;
         default:
