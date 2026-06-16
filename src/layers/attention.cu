@@ -85,16 +85,19 @@ __device__ __forceinline__ void float2half_load_to_smem(half* __restrict__ share
     }
 }
 
-// Assumes Row-Major layout
+// Assumes Row-Major layout: Pads SMEM with zeros if N is not divisible by Br or Bc
 __device__ __forceinline__ void fload_to_smem(float* __restrict__ shared_dst, 
     const float* __restrict__ global_src,
-    const int num_elements,
     int transpose, 
     const int row_dim,
     const int col_dim,
-    const int padding
+    const int padding,
+    const int global_row_offset,    // row offset from the beggining of [N, d]
+    const int max_rows
 ) 
 {
+    int num_elements = row_dim * col_dim;
+
     if (transpose) {
         int ldsmem = row_dim + padding; // How many elements to get to the other row
 
@@ -102,7 +105,11 @@ __device__ __forceinline__ void fload_to_smem(float* __restrict__ shared_dst,
             int s_col = idx / col_dim;
             int s_row = idx % col_dim;
             int s_idx = s_row * ldsmem + s_col;
-            shared_dst[s_idx] = global_src[idx];    
+            if ((global_row_offset + s_col) < max_rows) {
+                shared_dst[s_idx] = global_src[idx];
+            } else {
+                shared_dst[s_idx] = 0.0f;
+            }
             // smem shape: [col_dim, row_dim + padding]
         }
     } else {
@@ -112,7 +119,11 @@ __device__ __forceinline__ void fload_to_smem(float* __restrict__ shared_dst,
             int s_col = idx % col_dim;
             int s_row = idx / col_dim;
             int s_idx = s_row * ldsmem + s_col;
-            shared_dst[s_idx] = global_src[idx];
+            if ((global_row_offset + s_row) < max_rows) {
+                shared_dst[s_idx] = global_src[idx];
+            } else {
+                shared_dst[s_idx] = 0.0f;
+            }
             // smem shape: [row_dim, col_dim + padding]
         }
     }
@@ -133,6 +144,9 @@ const int d,
 const int Br,
 const int Bc,
 const int ELEMENTS_PER_ROW,
+const int i,
+const int j,
+const int N,
 int warpLane,
 int warpId,
 int warp_count)
@@ -141,14 +155,21 @@ int warp_count)
     for (int idx = threadIdx.x; idx < Br * Bc; idx += blockDim.x) {
         int tCol = idx % Bc;    // 0 to Bc-1
         int tRow = idx / Bc;    // 0 to Br-1
-
-        float qk_sum = 0.0f;
-        for (int k = 0; k < d; ++k) {
-            float q_val = s_Q[tRow * (d+1) + k];
-            float k_val = s_K[k * (Bc+1) + tCol];
-            qk_sum += q_val * k_val;
+        
+        int global_col = j + tCol;
+        int global_row = i + tRow;
+        
+        if (global_row < N && global_col < N) {
+            float qk_sum = 0.0f;
+            for (int k = 0; k < d; ++k) {
+                float q_val = s_Q[tRow * (d+1) + k];
+                float k_val = s_K[k * (Bc+1) + tCol];
+                qk_sum += q_val * k_val;
+            }
+            s_S[tRow * (Bc+1) + tCol] = qk_sum * scale;
+        } else {
+            s_S[tRow * (Bc+1) + tCol] = -INFINITY;
         }
-        s_S[tRow * (Bc+1) + tCol] = qk_sum * scale;
     }
     __syncthreads();
 
@@ -222,7 +243,7 @@ int warp_count)
 // Br, Bc = 64
 // Register of thread elements per row of O = d / 32.
 // Number of rows of a warp = Br / warp_count.
-template<const int ELEMENTS_PER_ROW, const int ROWS_PER_WARP>
+template<const int Br, const int Bc, const int ELEMENTS_PER_ROW, const int ROWS_PER_WARP>
 __global__ void flash_attn_forward_kernel(
     const float* __restrict__ Q, // Shape: [B, H, N, d]
     const float* __restrict__ K, // Shape: [B, H, N, d]
@@ -230,9 +251,7 @@ __global__ void flash_attn_forward_kernel(
     float* __restrict__ O,       // Shape: [B, H, N, d]
     const int H,
     const int N,                 // Same as sequence length
-    const int d,
-    const int Br,
-    const int Bc
+    const int d
 ) {
     int head_idx = blockIdx.x;
     int batch_idx = blockIdx.y;
@@ -296,7 +315,7 @@ __global__ void flash_attn_forward_kernel(
         }
 
         // Populate s_Q
-        fload_to_smem(s_Q, Q_local + i * d, Br * d, 0, Br, d, 1);
+        fload_to_smem(s_Q, Q_local + i * d, 0, Br, d, 1, i, N);
         __syncthreads();
 
         // Inner Loop over K and V: 
@@ -305,8 +324,8 @@ __global__ void flash_attn_forward_kernel(
         for (unsigned int j = 0; j < N; j += Bc) {
 
             // Populate rest smem: transpose K
-            fload_to_smem(s_K, K_local + j * d, Bc * d, 1, Bc, d, 1);
-            fload_to_smem(s_V, V_local + j * d, Bc * d, 0, Bc, d, 1);
+            fload_to_smem(s_K, K_local + j * d, 1, Bc, d, 1, j, N);
+            fload_to_smem(s_V, V_local + j * d, 0, Bc, d, 1, j, N);
             __syncthreads();
 
             // QK matmul, softmax, PV matmul
@@ -317,6 +336,7 @@ __global__ void flash_attn_forward_kernel(
                 thread_res_O,
                 scale, d,
                 Br, Bc, ELEMENTS_PER_ROW,
+                i, j, N,
                 warpLane, warpId, warp_count
             );
 
@@ -328,15 +348,16 @@ __global__ void flash_attn_forward_kernel(
         int warp_row_idx = 0;
         float* O_block = O_local + i * d;
         for (int warp_row = warpId; warp_row < Br; warp_row += warp_count) {
-            
-            float inv_l = 1/l_prev[warp_row_idx];
-            int o_col_idx = 0;
-            for (int idx = warpLane; idx < d; idx += 32) {
 
-                O_block[warp_row * d + idx] = inv_l * thread_res_O[warp_row_idx * ELEMENTS_PER_ROW + o_col_idx];
-                o_col_idx += 1;
+            int global_row = i + warp_row;
+            if (global_row < N) {
+                float inv_l = 1/l_prev[warp_row_idx];
+                int o_col_idx = 0;
+                for (int idx = warpLane; idx < d; idx += 32) {
+                    O_block[warp_row * d + idx] = inv_l * thread_res_O[warp_row_idx * ELEMENTS_PER_ROW + o_col_idx];
+                    o_col_idx += 1;
+                }
             }
-
             warp_row_idx += 1;
         }
     }
@@ -360,16 +381,10 @@ void launch_flash_attn_forward_kernel(
     dim3 gridDim(H, B);
     dim3 blockDim(256);
     const int warp_count = 256 / 32;
-    int Br;
-    int Bc;
-    if (Br < N) {
-        Br = 32;
-        Bc = 32;
-    } else {
-        Br = N;
-        Bc = N;
-    }
-    const int ROWS_PER_WARP = Br / warp_count;
+    const int Br = 32;
+    const int Bc = 32;
+    const int ELEMENTS_PER_ROW = 64 / 32; // d / 32 = 2 registers
+    const int ROWS_PER_WARP = Br / warp_count;  // 32 / 8 = 4 rows
 
     size_t shared_mem_bytes = (size_t)Br * (d + 1); // Padding for s_Q
     shared_mem_bytes += (size_t)d * (Bc+1);         // Padding for s_K: TRANPOSED
@@ -379,7 +394,7 @@ void launch_flash_attn_forward_kernel(
 
     switch (d) {
         case 64: // GPT2 Case
-            flash_attn_forward_kernel<2, ROWS_PER_WARP><<<gridDim, blockDim, shared_mem_bytes, stream>>>(Q, K, V, O, H, N, d, Br, Bc);
+            flash_attn_forward_kernel<Br, Bc, ELEMENTS_PER_ROW, ROWS_PER_WARP><<<gridDim, blockDim, shared_mem_bytes, stream>>>(Q, K, V, O, H, N, d);
             CHECK_LAST_CUDA_ERROR();
             break;
         default:
