@@ -181,11 +181,14 @@ int warp_count)
         for (int idx = warpLane; idx < Bc; idx += 32) {
             float val = s_S[warp_row * (Bc+1) + idx];
 
-            float m_old = m_i[warp_row_idx];     // store old local max
-            m_i[warp_row_idx] = fmaxf(m_i[warp_row_idx], val);    // obtain new local max
+            // Ignore out-of-bounds padded values
+            if (val != -INFINITY) {
+                float m_old = m_i[warp_row_idx];     // store old local max
+                m_i[warp_row_idx] = fmaxf(m_i[warp_row_idx], val);    // obtain new local max
 
-            l_i[warp_row_idx] *= expf(m_old - m_i[warp_row_idx]); // scale old norm
-            l_i[warp_row_idx] += expf(val - m_i[warp_row_idx]);   // add current contribution
+                l_i[warp_row_idx] *= expf(m_old - m_i[warp_row_idx]); // scale old norm
+                l_i[warp_row_idx] += expf(val - m_i[warp_row_idx]);   // add current contribution
+            }
         }
 
         // Warp shuffle online softmax
@@ -202,7 +205,13 @@ int warp_count)
 
         // Calculate unnorm P
         for (int idx = warpLane; idx < Bc; idx += 32) {
-            s_S[warp_row * (Bc+1) + idx] = expf(s_S[warp_row * (Bc+1) + idx] - m_i[warp_row_idx]);
+            float val = s_S[warp_row * (Bc+1) + idx];
+            
+            if (val != -INFINITY) {
+                s_S[warp_row * (Bc+1) + idx] = expf(val - m_i[warp_row_idx]);
+            } else {
+                s_S[warp_row * (Bc+1) + idx] = 0.0f; // expf(-INFT)   
+            }
         }
         __syncwarp();
 
@@ -303,7 +312,7 @@ __global__ void flash_attn_forward_kernel(
     // Outer Loop over Q and O
     for (unsigned int i = 0; i < N; i += Br) {
 
-        // Initialize running statistics and registers for Q_i block
+        // Initialize global running statistics and registers for Q_i block
         for (int r = 0; r < ROWS_PER_WARP; ++r) {
             m_prev[r] = -INFINITY;
             l_prev[r] = 0.0f;
@@ -327,6 +336,12 @@ __global__ void flash_attn_forward_kernel(
             fload_to_smem(s_K, K_local + j * d, 1, Bc, d, 1, j, N);
             fload_to_smem(s_V, V_local + j * d, 0, Bc, d, 1, j, N);
             __syncthreads();
+
+            // re-initialize block-local running statistics per inner-loop
+            for (int r = 0; r < ROWS_PER_WARP; ++r) {
+                m_i[r] = -INFINITY;
+                l_i[r] = 0.0f;
+            }
 
             // QK matmul, softmax, PV matmul
             tile_attention(
