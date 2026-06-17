@@ -152,7 +152,7 @@ int warp_count)
                     float qk_sum = 0.0f;
                     for (int k = 0; k < d; ++k) {
                         float q_val = s_Q[warp_row * (d+1) + k];
-                        float k_val = s_Q[k * (Bc+1) + idx];
+                        float k_val = s_K[k * (Bc+1) + idx];
                         qk_sum += q_val * k_val;
                     }
                     s_S[warp_row * (Bc+1) + idx] = qk_sum * scale;
