@@ -139,7 +139,7 @@ int warpLane,
 int warpId,
 int warp_count)
 {   
-    // Tilling rows of Q
+    // 
     int warp_row_idx = 0;
     for (int warp_row = warpId; warp_row < Br; warp_row += warp_count) {
         int global_row = i + warp_row;
@@ -171,7 +171,6 @@ int warp_count)
 
                     l_i[warp_row_idx] *= expf(m_old - m_i[warp_row_idx]); // scale old norm
                     l_i[warp_row_idx] += expf(val - m_i[warp_row_idx]);   // add current contribution
-                    
                 }
             }
 
@@ -209,6 +208,7 @@ int warp_count)
             for (int idx = warpLane; idx < d; idx += 32) {
                 float pv_sum = 0.0f;
                 for (int k = 0; k < Bc; ++k) {
+                    // Inner dimension boundary check:
                     int global_col = j + k;
                     if (global_col < N) {
                         float p_val = s_S[warp_row * (Bc+1) + k];
@@ -379,7 +379,7 @@ void launch_flash_mha_fwd_v1(
 
     switch (d) {
         case 64: // GPT2 Case
-            flash_mha_fwd_prefill<Br, Bc, ELEMENTS_PER_ROW, ROWS_PER_WARP><<<gridDim, blockDim, shared_mem_bytes, stream>>>(Q, K, V, O, H, N, d);
+            flash_mha_fwd_v1<Br, Bc, ELEMENTS_PER_ROW, ROWS_PER_WARP><<<gridDim, blockDim, shared_mem_bytes, stream>>>(Q, K, V, O, H, N, d);
             CHECK_LAST_CUDA_ERROR();
             break;
         default:
