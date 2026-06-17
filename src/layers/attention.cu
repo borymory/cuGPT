@@ -139,7 +139,7 @@ int warpLane,
 int warpId,
 int warp_count)
 {   
-    // 
+    // Warp-Level tiling of Q, S, and O.
     int warp_row_idx = 0;
     for (int warp_row = warpId; warp_row < Br; warp_row += warp_count) {
         int global_row = i + warp_row;
@@ -237,7 +237,7 @@ int warp_count)
 // Br, Bc = 64
 // Register of thread elements per row of O = d / 32.
 // Number of rows of a warp = Br / warp_count.
-template<const int Br, const int Bc, const int ELEMENTS_PER_ROW, const int ROWS_PER_WARP>
+template<const int Br, const int Bc, const int ELEMENTS_PER_ROW, const int ROWS_PER_WARP, const int warp_count>
 __global__ void flash_mha_fwd_v1(
     const float* __restrict__ Q, // Shape: [B, H, N, d]
     const float* __restrict__ K, // Shape: [B, H, N, d]
@@ -279,15 +279,17 @@ __global__ void flash_mha_fwd_v1(
     float thread_res_O[ROWS_PER_WARP * ELEMENTS_PER_ROW];
     int warpLane = threadIdx.x % 32;    // 0 to 31
     int warpId = threadIdx.x / 32;  // 0 to 7
-    int warp_count = blockDim.x / 32; // 8
     
     // Outer Loop over Q and O
     for (unsigned int i = 0; i < N; i += Br) {
 
         // Initialize global stats and registers for O_i block
+        #pragma unroll
         for (int r = 0; r < ROWS_PER_WARP; ++r) {
             m_prev[r] = -INFINITY;
             l_prev[r] = 0.0f;
+            
+            #pragma unroll
             for (int c = 0; c < ELEMENTS_PER_ROW; ++c){
                 thread_res_O[r * ELEMENTS_PER_ROW + c] = 0.0f;
             }
@@ -298,8 +300,8 @@ __global__ void flash_mha_fwd_v1(
         __syncthreads();
 
         // Inner Loop over K and V: 
-        // Populates m_prev, l_prev with final softmax and thread_res_O register
-        // cache with the final O chunk values
+        // Populates m_prev, l_prev with final softmax and
+        // thread_res_O register cache with the final values
         for (unsigned int j = 0; j < N; j += Bc) {
 
             // Populate rest smem: transpose K
@@ -308,12 +310,14 @@ __global__ void flash_mha_fwd_v1(
             __syncthreads();
 
             // Initialize block-local stats per inner-loop
+            #pragma unroll
             for (int r = 0; r < ROWS_PER_WARP; ++r) {
                 m_i[r] = -INFINITY;
                 l_i[r] = 0.0f;
             }
 
             // QK matmul, softmax, PV matmul
+            // Populates: m_i, l_i, m_prev, l_prev, thread_res_O
             tile_attention(
                 s_Q, s_K, s_V, s_S,
                 m_i, l_i,
@@ -324,27 +328,28 @@ __global__ void flash_mha_fwd_v1(
                 i, j, N,
                 warpLane, warpId, warp_count
             );
-
             __syncthreads();
         }
 
-
-        // load final output from registers to GMEM
-        int warp_row_idx = 0;
+        // Load final output from registers to GMEM
         float* O_block = O_local + i * d;
-        for (int warp_row = warpId; warp_row < Br; warp_row += warp_count) {
+        #pragma unroll
+        for (int r = 0; r < ROWS_PER_WARP; ++r) {
+            int warp_row = warpId + (r * warp_count);
 
-            int global_row = i + warp_row;
+            int global_row = i + (r * warp_count);
             if (global_row < N) {
-                float inv_l = 1/l_prev[warp_row_idx];
-                int o_col_idx = 0;
-                for (int idx = warpLane; idx < d; idx += 32) {
-                    O_block[warp_row * d + idx] = inv_l * thread_res_O[warp_row_idx * ELEMENTS_PER_ROW + o_col_idx];
-                    o_col_idx += 1;
+                float inv_l = 1.0f / l_prev[r];
+                
+                #pragma unroll
+                for (int c = 0; c < ELEMENTS_PER_ROW; ++c) {
+                    int idx = warpLane + (c * 32);
+                    if (idx < d) {
+                        O_block[warp_row * d + idx] = inv_l * thread_res_O[r * ELEMENTS_PER_ROW + c];
+                    }
                 }
             }
-            warp_row_idx += 1;
-        }
+        } 
     }
 }
 
@@ -379,7 +384,7 @@ void launch_flash_mha_fwd_v1(
 
     switch (d) {
         case 64: // GPT2 Case
-            flash_mha_fwd_v1<Br, Bc, ELEMENTS_PER_ROW, ROWS_PER_WARP><<<gridDim, blockDim, shared_mem_bytes, stream>>>(Q, K, V, O, H, N, d);
+            flash_mha_fwd_v1<Br, Bc, ELEMENTS_PER_ROW, ROWS_PER_WARP, warp_count><<<gridDim, blockDim, shared_mem_bytes, stream>>>(Q, K, V, O, H, N, d);
             CHECK_LAST_CUDA_ERROR();
             break;
         default:
