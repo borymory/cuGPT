@@ -117,7 +117,15 @@ __device__ __forceinline__ void fload_to_smem(float* __restrict__ shared_dst,
     }
 }
 
-template<const int Br, const int Bc, const int d, const int ROWS_PER_WARP, const int COLS_PER_WARP, const int ELEMENTS_PER_ROW, const int warp_count>
+template<
+const int Br, 
+const int Bc, 
+const int d, 
+const int ROWS_PER_WARP, 
+const int COLS_PER_WARP, 
+const int ELEMENTS_PER_ROW, 
+const int warp_count
+>
 __device__ __forceinline__ void tile_attention(
 const float* __restrict__ s_Q, 
 const float* __restrict__ s_K, 
@@ -133,8 +141,8 @@ const int i,
 const int j,
 const int N,
 int warpLane,
-int warpId)
-{   
+int warpId
+) {   
     // Warp-Level tiling of Q, S, and O.
     #pragma unroll
     for (int r = 0; r < ROWS_PER_WARP; ++r) {
@@ -147,7 +155,7 @@ int warpId)
             for (int c = 0; c < COLS_PER_WARP; ++c) {
                 int idx = warpLane + (c * 32);
                 int global_col = j + idx;
-                if (global_col < N && idx < Bc) {
+                if (global_col < N) {
                     float qk_sum = 0.0f;
 
                     #pragma unroll
@@ -166,7 +174,7 @@ int warpId)
             for (int c = 0; c < COLS_PER_WARP; ++c) {
                 int idx = warpLane + (c * 32);
                 int global_col = j + idx;
-                if (global_col < N && idx < Bc) {
+                if (global_col < N) {
                     float val = s_S[warp_row * (Bc+1) + idx];
                     
                     float m_old = m_i[r];     // store old local max
@@ -185,9 +193,14 @@ int warpId)
 
                 float max = fmaxf(m_i[r], m_j);    // max = max(m_i, m_j)
 
-                l_i[r] *= expf(m_i[r] - max);    // rescale old sum
-                l_i[r] += l_j * expf(m_j - max);       // add contribution from the new sum
-                m_i[r] = max;                 // store new max
+                if (max != -INFINITY) {
+                    l_i[r] *= expf(m_i[r] - max);    // rescale old sum
+                    l_i[r] += l_j * expf(m_j - max);       // add contribution from the new sum
+                    m_i[r] = max;                 // store new max
+                } else {
+                    l_i[r] = 0.0f;
+                    m_i[r] = -INFINITY;
+                }
             }
 
             // Calculate unnorm P
@@ -196,7 +209,7 @@ int warpId)
                 int idx = warpLane + (c * 32);
                 float val = s_S[warp_row * (Bc+1) + idx];
                 int global_col = j + idx;
-                if (global_col < N && idx < Bc) {
+                if (global_col < N) {
                     s_S[warp_row * (Bc+1) + idx] = expf(val - m_i[r]);
                 }
             }
@@ -210,7 +223,6 @@ int warpId)
             l_prev[r] = prev_scale * l_prev[r] + current_scale * l_i[r];
 
             // PV Matmul: P [Br, Bc], V [Bc, d]
-            int o_col_idx = 0;
             #pragma unroll
             for (int c = 0; c < ELEMENTS_PER_ROW; ++c) {
                 int idx = warpLane + (c * 32);
@@ -220,16 +232,15 @@ int warpId)
                 for (int k = 0; k < Bc; ++k) {
                     // Inner dimension boundary check:
                     int global_col = j + k;
-                    if (global_col < N && idx < d) {
+                    if (global_col < N) {
                         float p_val = s_S[warp_row * (Bc+1) + k];
                         float v_val = s_V[k * (d+1) + idx];
                         pv_sum += p_val * v_val;
                     }
                 }
-                thread_res_O[r * ELEMENTS_PER_ROW + o_col_idx] *= prev_scale;   // scale prev O chunk
+                thread_res_O[r * ELEMENTS_PER_ROW + c] *= prev_scale;   // scale prev O chunk
                 pv_sum *= current_scale;    // scale pv_sum w.r.t. global stats
-                thread_res_O[r * ELEMENTS_PER_ROW + o_col_idx] += pv_sum;   // add current PV chunk
-                o_col_idx += 1;
+                thread_res_O[r * ELEMENTS_PER_ROW + c] += pv_sum;   // add current PV chunk
             }
         }
     }
@@ -246,7 +257,15 @@ int warpId)
 // Br, Bc = 64
 // Register of thread elements per row of O = d / 32.
 // Number of rows of a warp = Br / warp_count.
-template<const int Br, const int Bc, const int d, const int ROWS_PER_WARP, const int COLS_PER_WARP, const int ELEMENTS_PER_ROW, const int warp_count>
+template<
+const int Br, 
+const int Bc, 
+const int d, 
+const int ROWS_PER_WARP, 
+const int COLS_PER_WARP, 
+const int ELEMENTS_PER_ROW, 
+const int warp_count
+>
 __global__ void flash_mha_fwd_v1(
     const float* __restrict__ Q, // Shape: [B, H, N, d]
     const float* __restrict__ K, // Shape: [B, H, N, d]
@@ -343,8 +362,7 @@ __global__ void flash_mha_fwd_v1(
         #pragma unroll
         for (int r = 0; r < ROWS_PER_WARP; ++r) {
             int warp_row = warpId + (r * warp_count);
-
-            int global_row = i + (r * warp_count);
+            int global_row = i + warp_row;
             if (global_row < N) {
                 float inv_l = 1.0f / l_prev[r];
                 
