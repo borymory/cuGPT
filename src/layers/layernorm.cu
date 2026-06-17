@@ -37,7 +37,7 @@ void cpu_layernorm_fwd(float *X, float *X_norm, float *alpha, float *beta, int B
 // GPU Kernels
 //
 
-// Input: X[BT, C], X_norm[BT, C], alpha[C], beta[C]
+// Tensors: X[BT, C], X_norm[BT, C], alpha[C], beta[C]
 template<const int block_BT>
 __global__ void layernorm_fwd_v1(float *X, float *X_norm, float *alpha, float *beta, int BT, int C) {
     // Launch CEIL_DIV(BT, block_BT) many blocks

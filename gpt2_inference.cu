@@ -88,6 +88,24 @@ __global__ void layernorm_fwd_v1(float *X, float *X_norm, float *alpha, float *b
 
 }
 
+// Op: d_out [B * current_seq_len, C] + d_bias[C] (broadcasted to every row)
+// Out: d_out [B * current_seq_len, C]
+__global__ void proj_bias_add (
+    float* __restrict__ d_out,
+    const float* __restrict__ d_bias,
+    const int B,
+    const int current_seq_len,
+    const int C)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int num_elements = B * current_seq_len * C;
+
+    if (idx < num_elements) {
+        int col = idx % C;  // Broadcast: corresponsing bias entry
+        d_out[idx] += d_bias[col];
+    }
+}
+
 // Kernel Launchers
 void launch_embedding_v1(int *inputs, float *out, float *wte, float *wpe, int B, int T, int C, int max_length, cudaStream_t stream) {
     int total_elements = B * T * C;
@@ -111,6 +129,54 @@ void layernorm_forward_v1(float *X, float *X_norm,
     CHECK_LAST_CUDA_ERROR();
 }
 
+void launch_proj_bias_add (
+    float* __restrict__ d_out,
+    const float* __restrict__ d_bias,
+    const int B,
+    const int current_seq_len,
+    const int C,
+    cudaStream_t stream)
+{
+    int total_elements = B * current_seq_len * C;
+    int block_size = 256;
+    int grid_size = CEIL_DIV(total_elements, block_size);
+
+    proj_bias_add<<<grid_size, block_size, 0, stream>>>(d_out, d_bias, B, current_seq_len, C);
+    CHECK_LAST_CUDA_ERROR();
+}
+
+void qkv_proj_append_to_KV_cache(
+    cublasHandle_t cublas_handle,
+    const float* __restrict__ X_norm, // [B * seq_len, C]
+    const float* __restrict__ w_q, // [C, C]
+    const float* __restrict__ w_k, // [C, C]
+    const float* __restrict__ w_v, // [C, C]
+    const float* __restrict__ b_q, // [C]
+    const float* __restrict__ b_k, // [C]
+    const float* __restrict__ b_v, // [C]
+    float* __restrict__ key_cache,  // Written: [B, seq_len, C]
+    float* __restrict__ value_cache, // Written: [B, seq_len, C]
+    float* __restrict__ q_scratch, // Written: [B, seq_len, C]
+    const int B,
+    const int current_seq_len,
+    const int C,
+    cudaStream_t stream)
+{
+    cublasSetStream(cublas_handle, stream);
+
+    // QKV Proj
+   cuGPT::gemm(cublas_handle, X_norm, w_q, q_scratch, B * current_seq_len, C, C);
+   cuGPT::gemm(cublas_handle, X_norm, w_k, key_cache, B * current_seq_len, C, C);
+   cuGPT::gemm(cublas_handle, X_norm, w_v, value_cache, B * current_seq_len, C, C);
+
+   // QKV Bias
+   launch_proj_bias_add(q_scratch, b_q, B, current_seq_len, C, stream);
+   launch_proj_bias_add(key_cache, b_k, B, current_seq_len, C, stream);
+   launch_proj_bias_add(value_cache, b_v, B, current_seq_len, C, stream);
+}
+
+
+
 //
 // MODEL DEFINITION
 //
@@ -128,6 +194,7 @@ typedef struct {
 typedef enum {
     EMBED_OUT_IDX = 0,
     X_NORM_IDX,
+    Q_SCRATCH_IDX,
 
     NUM_ACTIVATIONS
 } ActivationIndex;
@@ -163,7 +230,7 @@ typedef enum {
 
 typedef struct {
     int max_seq_len;// max sequence length (e.g., 1024)
-    int batch;      // max batch count
+    int max_batch;      // max batch count
     int vocab_size; // vocab_size (e.g., 50257)
     int layers;     // num of layers (e.g., 12)
     int heads;      // num of heads (e.g., 12)
@@ -179,9 +246,9 @@ typedef struct {
     float* ln_1_alpha;  // [L, C]
     float* ln_1_beta;   // [L, C]
 
-    float* proj_w_q;    // [L, C, H, d_head]
-    float* proj_w_k;    // [L, C, H, d_head]
-    float* proj_w_v;    // [L, C, H, d_head]
+    float* proj_w_q;    // [L, C, C]
+    float* proj_w_k;    // [L, C, C]
+    float* proj_w_v;    // [L, C, C]
     float* proj_b_q;    // [L, C]
     float* proj_b_k;    // [L, C]
     float* proj_b_v;    // [L, C]
@@ -205,11 +272,12 @@ typedef struct {
 typedef struct {
     float* embedding_out; // [B, max_T, C]
     float* X_norm;  // [B, max_T, C]
+    float* scratch_query;   // [B, max_T, C]
 } model_activations;
 
 typedef struct {
-    float* key_cache;   // [L, max_B, H, max_T, d_head]
-    float* value_cache; // [L, max_B, H, max_T, d_head]
+    float* key_cache;   // [L, max_B, max_T, C]
+    float* value_cache; // [L, max_B, max_T, C]
 } KV_cache;
 
 typedef struct {
@@ -300,6 +368,8 @@ void calculate_activ_buffer_size (size_t* activ_size, model_config config) {
 
     activ_size[EMBED_OUT_IDX] = (size_t)max_T * C;
     activ_size[X_NORM_IDX] = (size_t)max_T * C;
+
+    activ_size[Q_SCRATCH_IDX] = (size_t)max_T * C;
     // populate activ_size array with further hidden activations
 }
 
@@ -349,7 +419,8 @@ float* malloc_and_point_to_activations(size_t* activ_size, model_activations* ac
 
     // array of adresses to model activ pointers
     float** ptrs[] = {
-        &activations->embedding_out, &activations->X_norm // add more pointer adresses as more activations need to be sliced
+        &activations->embedding_out, &activations->X_norm, &activations->scratch_query
+        // add more pointer adresses as more activations need to be sliced
     };
     int num_ptrs = sizeof(ptrs) / sizeof(ptrs[0]);
     if (num_ptrs != NUM_ACTIVATIONS) {
@@ -367,6 +438,23 @@ float* malloc_and_point_to_activations(size_t* activ_size, model_activations* ac
     return activs_memory;
 }
 
+float* malloc_and_point_to_KV_cache(model_config config, KV_cache* model_kv_cache) {
+    int max_T = config.max_seq_len;
+    int max_B = config.max_batch;
+    int L = config.layers;
+    int C = config.channels;
+
+    size_t total_KV_cache_size = (size_t)2 * L * max_B * max_T * C;
+
+    float* kv_cache_memory;
+    CUDA_CHECK(cudaMalloc((void**)&kv_cache_memory, total_KV_cache_size * sizeof(float)));
+
+    model_kv_cache->key_cache = kv_cache_memory;
+    model_kv_cache->value_cache = kv_cache_memory + (size_t)L * max_B * max_T * C;
+
+    return kv_cache_memory;
+}
+
 // Initializes the model on GPU with weights loaded
 model init_model(model_config config, const char* checkpoint_path) {
     model m;
@@ -381,6 +469,7 @@ model init_model(model_config config, const char* checkpoint_path) {
     // create GPU side buffer with correct weight/activation ptrs and base ptr
     m.d_weights_base = malloc_and_point_to_weights(param_size, &m.d_weights);
     m.d_activations_base = malloc_and_point_to_activations(activ_size, &m.d_activations);
+    m.d_kv_cache_base = malloc_and_point_to_KV_cache(m.config, &m.d_kv_cache);
 
     // load weights onto CPU, then copy to GPU
     size_t total_elements = 0;
@@ -473,11 +562,12 @@ void free_model(model* m) {
 //
 // Forward Pass (B == 1) for now
 //
-void prefill_forward(model* m, cudaStream_t stream) {
+void prefill_forward(model* m, cudaStream_t stream, cublasHandle_t cublas_handle) {
     int current_seq_len = m->current_seq_len;
     int C = m->config.channels;
     int max_seq_len = m->config.max_seq_len;
     int L = m->config.layers;
+    int max_B = m->config.max_batch;
 
     // Preprocessing
     int* user_prompt = m->d_prompt;
@@ -489,13 +579,35 @@ void prefill_forward(model* m, cudaStream_t stream) {
     // Activations can be declared out of the loop,
     // and can be overwritten at each layer:
     float* X_norm = m->d_activations.X_norm;
+    float* q_cache_scratch = m->d_activations.scratch_query;
 
     // L-1 for proper layer offest indexology: 
     for (int l = 0; l < L-1; ++l) {
+
         // embedding_out is the current residual
         float* alpha = m->d_weights.ln_1_alpha + l * C;
         float* beta = m->d_weights.ln_1_beta + l * C;
         layernorm_forward_v1(embedding_out, X_norm, alpha, beta, 1*current_seq_len, C, stream);
+        // X_norm [B(=1) * current_seq_len, C]
+
+        // pre-attn
+        float* w_q_layer = m->d_weights.proj_w_q + (l * C * C);
+        float* w_k_layer = m->d_weights.proj_w_k + (l * C * C);
+        float* w_v_layer = m->d_weights.proj_w_v + (l * C * C);
+        float* b_q_layer = m->d_weights.proj_b_q + (l * C);
+        float* b_k_layer = m->d_weights.proj_b_k + (l * C);
+        float* b_v_layer = m->d_weights.proj_b_v + (l * C);
+        // q_cache_scratch
+        float* key_cache_layer = m->d_kv_cache.key_cache + (l * max_B * max_seq_len * C);
+        float* value_cache_layer = m->d_kv_cache.value_cache + (l * max_B * max_seq_len * C);
+        qkv_proj_append_to_KV_cache(cublas_handle, 
+            X_norm, 
+            w_q, w_k, w_v, 
+            b_q, b_k, b_v, 
+            key_cache_layer, value_cache_layer, q_cache_scratch,
+            1, current_seq_len, C // Format: (current_batch, current_seq_len, channel)
+        );
+
         // x = attn
 
         // attn(x) = attn(x) + embedding_out (element wise)
@@ -510,7 +622,7 @@ void prefill_forward(model* m, cudaStream_t stream) {
     // x softmax
     // x sampler
     // increase current_seq_len by one!
-    // apped the new sampled idx to m->d_prompt by user_prompt and send this to decode_forward
+    // append the new sampled idx to m->d_prompt by user_prompt and send this to decode_forward
 }
 
 //
@@ -518,6 +630,8 @@ void prefill_forward(model* m, cudaStream_t stream) {
 //
 
 int main(int argc, char* argv[]) {
+    cublasHandle_t cublas_handle;
+    cublasCreate(&cublas_handle);
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
     // argc: argument count
@@ -533,7 +647,7 @@ int main(int argc, char* argv[]) {
 
     // Init model
     const char* checkpoint_path = argv[1]; // "checkpoints/gpt2_124m.bin"
-    model_config GPT2Config = {1024, 1, 50257, 12, 12, 768}; // batch = 1
+    model_config GPT2Config = {1024, 1, 50257, 12, 12, 768}; // max_batch = 1
     model cuGPT = init_model(GPT2Config, checkpoint_path);
 
     // Prompt model
@@ -543,7 +657,7 @@ int main(int argc, char* argv[]) {
     // Inference loop:
 
     // Prefill Phase
-    prefill_forward(&cuGPT, stream);
+    prefill_forward(&cuGPT, stream, cublas_handle);
 
     // Decode Phase
     // include check whether <EOS> token is reached
@@ -554,6 +668,7 @@ int main(int argc, char* argv[]) {
     }
 
     free_model(&cuGPT);
+    cublasDestroy(cublas_handle);
     CUDA_CHECK(cudaStreamDestroy(stream));
     return 0;
 }

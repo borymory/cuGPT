@@ -41,5 +41,4 @@ void lm_head_fwd(cublasHandle_t cublas_handle,
     // X_final [BT, C]
     // wte  [vocab_size, C]
     cuGPT::gemm_transposed(cublas_handle, X_final, wte, logits, BT, vocab_size, C);
-
 }
