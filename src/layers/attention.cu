@@ -73,18 +73,6 @@ void cpu_attention(
 // Helper Funcs
 //
 
-
-// GMEM->SMEM load helper with FP32->FP16 casting: UNUSED
-__device__ __forceinline__ void float2half_load_to_smem(half* __restrict__ shared_dst, 
-    const float* __restrict__ global_src, 
-    const int num_elements) 
-{
-
-    for (int i = threadIdx.x; i < num_elements; i += blockDim.x) {
-        shared_dst[i] = __float2half(global_src[i]);
-    }
-}
-
 // Assumes Row-Major layout: Pads SMEM with zeros if N is not divisible by Br or Bc
 __device__ __forceinline__ void fload_to_smem(float* __restrict__ shared_dst, 
     const float* __restrict__ global_src,
@@ -151,92 +139,89 @@ int warpLane,
 int warpId,
 int warp_count)
 {   
-    // QK Matmul: Q [Br, d], K^T [d, Bc]
-    for (int idx = threadIdx.x; idx < Br * Bc; idx += blockDim.x) {
-        int tCol = idx % Bc;    // 0 to Bc-1
-        int tRow = idx / Bc;    // 0 to Br-1
-        
-        int global_col = j + tCol;
-        int global_row = i + tRow;
-        
-        if (global_row < N && global_col < N) {
-            float qk_sum = 0.0f;
-            for (int k = 0; k < d; ++k) {
-                float q_val = s_Q[tRow * (d+1) + k];
-                float k_val = s_K[k * (Bc+1) + tCol];
-                qk_sum += q_val * k_val;
-            }
-            s_S[tRow * (Bc+1) + tCol] = qk_sum * scale;
-        } else {
-            s_S[tRow * (Bc+1) + tCol] = -INFINITY;
-        }
-    }
-    __syncthreads();
-
-    // Online Softmax: Tiling S and calculating O values
+    // Tilling rows of Q
     int warp_row_idx = 0;
     for (int warp_row = warpId; warp_row < Br; warp_row += warp_count) {
-        
-        // Reduce s_S into registers, doing statistics
-        for (int idx = warpLane; idx < Bc; idx += 32) {
-            float val = s_S[warp_row * (Bc+1) + idx];
+        int global_row = i + warp_row;
+        if (global_row < N) {
 
-            // Ignore out-of-bounds padded values
-            if (val != -INFINITY) {
-                float m_old = m_i[warp_row_idx];     // store old local max
-                m_i[warp_row_idx] = fmaxf(m_i[warp_row_idx], val);    // obtain new local max
+            // QK Matmul: Q [Br, d], K^T [d, Bc]
+            for (int idx = warpLane; idx < Bc; idx += 32) {
+                int global_col = j + idx;
+                if (global_col < N) {
+                    float qk_sum = 0.0f;
+                    for (int k = 0; k < d; ++k) {
+                        float q_val = s_Q[warp_row * (d+1) + k];
+                        float k_val = s_Q[k * (Bc+1) + idx];
+                        qk_sum += q_val * k_val;
+                    }
+                    s_S[warp_row * (Bc+1) + idx] = qk_sum * scale;
+                }
+            }
+            __syncwarp();
 
-                l_i[warp_row_idx] *= expf(m_old - m_i[warp_row_idx]); // scale old norm
-                l_i[warp_row_idx] += expf(val - m_i[warp_row_idx]);   // add current contribution
+            // Reduce s_S into registers, doing statistics
+            for (int idx = warpLane; idx < Bc; idx += 32) {
+                int global_col = j + idx;
+                if (global_col < N) {
+                    float val = s_S[warp_row * (Bc+1) + idx];
+                    
+                    float m_old = m_i[warp_row_idx];     // store old local max
+                    m_i[warp_row_idx] = fmaxf(m_i[warp_row_idx], val);    // obtain new local max
+
+                    l_i[warp_row_idx] *= expf(m_old - m_i[warp_row_idx]); // scale old norm
+                    l_i[warp_row_idx] += expf(val - m_i[warp_row_idx]);   // add current contribution
+                    
+                }
+            }
+
+            // Warp shuffle online softmax
+            for (unsigned int mirrorIdx = 1; mirrorIdx <= 16; mirrorIdx <<= 1) {
+                float m_j = __shfl_xor_sync(FULL_MASK, m_i[warp_row_idx], mirrorIdx);     // obtain m_j from another thread
+                float l_j = __shfl_xor_sync(FULL_MASK, l_i[warp_row_idx], mirrorIdx);     // obtain l_j from another thread
+
+                float max = fmaxf(m_i[warp_row_idx], m_j);    // max = max(m_i, m_j)
+
+                l_i[warp_row_idx] *= expf(m_i[warp_row_idx] - max);    // rescale old sum
+                l_i[warp_row_idx] += l_j * expf(m_j - max);       // add contribution from the new sum
+                m_i[warp_row_idx] = max;                 // store new max
+            }
+
+            // Calculate unnorm P
+            for (int idx = warpLane; idx < Bc; idx += 32) {
+                float val = s_S[warp_row * (Bc+1) + idx];
+                int global_col = j + idx;
+                if (global_col < N) {
+                    s_S[warp_row * (Bc+1) + idx] = expf(val - m_i[warp_row_idx]);
+                }
+            }
+            __syncwarp();
+
+            // Calculate global stats - store the new stats
+            float m_new = fmaxf(m_prev[warp_row_idx], m_i[warp_row_idx]);
+            float prev_scale = expf(m_prev[warp_row_idx] - m_new);
+            float current_scale = expf(m_i[warp_row_idx] - m_new);
+            m_prev[warp_row_idx] = m_new;
+            l_prev[warp_row_idx] = prev_scale * l_prev[warp_row_idx] + current_scale * l_i[warp_row_idx];
+
+            // PV Matmul: P [Br, Bc], V [Bc, d]
+            int o_col_idx = 0;
+            for (int idx = warpLane; idx < d; idx += 32) {
+                float pv_sum = 0.0f;
+                for (int k = 0; k < Bc; ++k) {
+                    int global_col = j + k;
+                    if (global_col < N) {
+                        float p_val = s_S[warp_row * (Bc+1) + k];
+                        float v_val = s_V[k * (d+1) + idx];
+                        pv_sum += p_val * v_val;
+                    }
+                }
+                thread_res_O[warp_row_idx * ELEMENTS_PER_ROW + o_col_idx] *= prev_scale;   // scale prev O chunk
+                pv_sum *= current_scale;    // scale pv_sum w.r.t. global stats
+                thread_res_O[warp_row_idx * ELEMENTS_PER_ROW + o_col_idx] += pv_sum;   // add current PV chunk
+                o_col_idx += 1;
             }
         }
-
-        // Warp shuffle online softmax
-        for (unsigned int mirrorIdx = 1; mirrorIdx <= 16; mirrorIdx <<= 1) {
-            float m_j = __shfl_xor_sync(FULL_MASK, m_i[warp_row_idx], mirrorIdx);     // obtain m_j from another thread
-            float l_j = __shfl_xor_sync(FULL_MASK, l_i[warp_row_idx], mirrorIdx);     // obtain l_j from another thread
-
-            float max = fmaxf(m_i[warp_row_idx], m_j);    // max = max(m_i, m_j)
-
-            l_i[warp_row_idx] *= expf(m_i[warp_row_idx] - max);    // rescale old sum
-            l_i[warp_row_idx] += l_j * expf(m_j - max);       // add contribution from the new sum
-            m_i[warp_row_idx] = max;                 // store new max
-        }
-
-        // Calculate unnorm P
-        for (int idx = warpLane; idx < Bc; idx += 32) {
-            float val = s_S[warp_row * (Bc+1) + idx];
-            
-            if (val != -INFINITY) {
-                s_S[warp_row * (Bc+1) + idx] = expf(val - m_i[warp_row_idx]);
-            } else {
-                s_S[warp_row * (Bc+1) + idx] = 0.0f; // expf(-INFT)   
-            }
-        }
-        __syncwarp();
-
-        // Calculate global stats - store the new stats
-        float m_new = fmaxf(m_prev[warp_row_idx], m_i[warp_row_idx]);
-        float prev_scale = expf(m_prev[warp_row_idx] - m_new);
-        float current_scale = expf(m_i[warp_row_idx] - m_new);
-        m_prev[warp_row_idx] = m_new;
-        l_prev[warp_row_idx] = prev_scale * l_prev[warp_row_idx] + current_scale * l_i[warp_row_idx];
-
-        // PV Matmul: P [Br, Bc], V [Bc, d]
-        int o_col_idx = 0;
-        for (int idx = warpLane; idx < d; idx += 32) {
-            float pv_sum = 0.0f;
-            for (int k = 0; k < Bc; ++k) {
-                float p_val = s_S[warp_row * (Bc+1) + k];
-                float v_val = s_V[k * (d+1) + idx];
-                pv_sum += p_val * v_val;
-            }
-            thread_res_O[warp_row_idx * ELEMENTS_PER_ROW + o_col_idx] *= prev_scale;   // scale prev O chunk
-            pv_sum *= current_scale;    // scale pv_sum w.r.t. global stats
-            thread_res_O[warp_row_idx * ELEMENTS_PER_ROW + o_col_idx] += pv_sum;   // add current PV chunk
-            o_col_idx += 1;
-        }
-
         warp_row_idx += 1;
     }
 }
@@ -253,7 +238,7 @@ int warp_count)
 // Register of thread elements per row of O = d / 32.
 // Number of rows of a warp = Br / warp_count.
 template<const int Br, const int Bc, const int ELEMENTS_PER_ROW, const int ROWS_PER_WARP>
-__global__ void flash_attn_forward_kernel(
+__global__ void flash_mha_fwd_v1(
     const float* __restrict__ Q, // Shape: [B, H, N, d]
     const float* __restrict__ K, // Shape: [B, H, N, d]
     const float* __restrict__ V, // Shape: [B, H, N, d]
@@ -292,19 +277,6 @@ __global__ void flash_attn_forward_kernel(
     float m_i[ROWS_PER_WARP];
     float l_i[ROWS_PER_WARP];
     float thread_res_O[ROWS_PER_WARP * ELEMENTS_PER_ROW];
-                // Check mapping: if you want to use warp shuffle for softmax
-                // you need ind. warps working on ind. rows of s_S. 
-                // Thus, a single warp works on multiple rows of s_S,
-                // and thus responsible for multiple rows of O.
-                // Equals, more register allocation both for statistics, and for
-                // the O output.
-                // Napkin math: 256 threads per block (8 warps).
-                // Meaning (Br)64/8 = 8 rows. (d)64 col / 32 thread = 2 registers per row.
-                // Thus a single thread in a warp has 8*2=16 registers. 256*16 = 4096 reg per block.
-                // Tesla T4: reg per SM:65536. my kernel: 4096 reg per block.
-                // 65536 / 4096 = 16 block per SM. Realistically,
-                // it will be less than 16, accounting for statistics registers...
-                // Max block per SM is 16, so this is a reasonable decision.
     int warpLane = threadIdx.x % 32;    // 0 to 31
     int warpId = threadIdx.x / 32;  // 0 to 7
     int warp_count = blockDim.x / 32; // 8
@@ -312,12 +284,10 @@ __global__ void flash_attn_forward_kernel(
     // Outer Loop over Q and O
     for (unsigned int i = 0; i < N; i += Br) {
 
-        // Initialize global running statistics and registers for Q_i block
+        // Initialize global stats and registers for O_i block
         for (int r = 0; r < ROWS_PER_WARP; ++r) {
             m_prev[r] = -INFINITY;
             l_prev[r] = 0.0f;
-            m_i[r] = -INFINITY;
-            l_i[r] = 0.0f;
             for (int c = 0; c < ELEMENTS_PER_ROW; ++c){
                 thread_res_O[r * ELEMENTS_PER_ROW + c] = 0.0f;
             }
@@ -337,7 +307,7 @@ __global__ void flash_attn_forward_kernel(
             fload_to_smem(s_V, V_local + j * d, 0, Bc, d, 1, j, N);
             __syncthreads();
 
-            // re-initialize block-local running statistics per inner-loop
+            // Initialize block-local stats per inner-loop
             for (int r = 0; r < ROWS_PER_WARP; ++r) {
                 m_i[r] = -INFINITY;
                 l_i[r] = 0.0f;
@@ -381,7 +351,7 @@ __global__ void flash_attn_forward_kernel(
 //
 // Kernel Wrappers
 //
-void launch_flash_attn_forward_kernel(
+void launch_flash_mha_fwd_v1(
     const float* __restrict__ Q, // Shape: [B, H, N, d]
     const float* __restrict__ K, // Shape: [B, H, N, d]
     const float* __restrict__ V, // Shape: [B, H, N, d]
@@ -409,7 +379,7 @@ void launch_flash_attn_forward_kernel(
 
     switch (d) {
         case 64: // GPT2 Case
-            flash_attn_forward_kernel<Br, Bc, ELEMENTS_PER_ROW, ROWS_PER_WARP><<<gridDim, blockDim, shared_mem_bytes, stream>>>(Q, K, V, O, H, N, d);
+            flash_mha_fwd_prefill<Br, Bc, ELEMENTS_PER_ROW, ROWS_PER_WARP><<<gridDim, blockDim, shared_mem_bytes, stream>>>(Q, K, V, O, H, N, d);
             CHECK_LAST_CUDA_ERROR();
             break;
         default:

@@ -23,7 +23,7 @@ void cpu_attention(
 );
 
 // Kernel Launcher
-void launch_flash_attn_forward_kernel(
+void launch_flash_mha_fwd_v1(
     const float* __restrict__ Q, // Shape: [B, H, N, d]
     const float* __restrict__ K, // Shape: [B, H, N, d]
     const float* __restrict__ V, // Shape: [B, H, N, d]

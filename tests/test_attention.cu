@@ -46,7 +46,7 @@ bool test_flashattn_fwd() {
   cpu_attention(Q, K, V, S_cpu, O_cpu, B, H, seq_len, d);
   fprintf(stderr, "DONE!\n");
   fprintf(stderr, "Running GPU_FLASHATTN_FWD: ");
-  launch_flash_attn_forward_kernel(Q, K, V, O, B, H, seq_len, d, stream);
+  launch_flash_mha_fwd_v1(Q, K, V, O, B, H, seq_len, d, stream);
   fprintf(stderr, "DONE!\n");
   CUDA_CHECK(cudaDeviceSynchronize());
   bool isExact = cuGPT::validate(O, O_cpu, tensor_size);
