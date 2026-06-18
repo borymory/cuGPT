@@ -230,7 +230,7 @@ typedef enum {
 
 typedef struct {
     int max_seq_len;// max sequence length (e.g., 1024)
-    int max_batch;      // max batch count
+    int max_batch;  // max batch count
     int vocab_size; // vocab_size (e.g., 50257)
     int layers;     // num of layers (e.g., 12)
     int heads;      // num of heads (e.g., 12)
@@ -270,9 +270,9 @@ typedef struct {
 } model_parameters;
 
 typedef struct {
-    float* embedding_out; // [B, max_T, C]
-    float* X_norm;  // [B, max_T, C]
-    float* scratch_query;   // [B, max_T, C]
+    float* embedding_out; // [max_B, max_T, C]
+    float* X_norm;  // [max_B, max_T, C]
+    float* scratch_query;   // [max_B, max_T, C]
 } model_activations;
 
 typedef struct {
@@ -284,7 +284,7 @@ typedef struct {
     model_config config;
     model_activations d_activations;    // sliced device activations
     model_parameters d_weights; // sliced device weights
-    KV_cache d_kv_cache;        // slices device KV cache
+    KV_cache d_kv_cache;        // sliced device KV cache
 
     float* h_weights_base;      // base ptr to host side weights
     float* d_weights_base;      // base ptr to device side weights
@@ -296,6 +296,8 @@ typedef struct {
     int current_seq_len;
     int* d_prompt;
 
+    // Creates host and device prompt buffer.
+    // Currently copies a single batch, with no batch offsets from CPU to GPU
     void prompt(char* argv[], const int prompt_len) {
         current_seq_len = prompt_len;
         size_t max_context_size = (size_t)config.max_seq_len * sizeof(int);
@@ -360,6 +362,7 @@ void calculate_param_buffer_size (size_t* param_size, model_config config) {
 
 // keeping batch==1 for now. declaring max_T instead of current 
 // since model can progress to max_seq_len if <EOS> is never met...
+// Excluded max_B, since currently working at a single batch. Normally, these activations must be declares of size max_B*max_T*C.
 void calculate_activ_buffer_size (size_t* activ_size, model_config config) {
     int max_T = config.max_seq_len;
     int V = config.vocab_size;
@@ -547,6 +550,7 @@ model init_model(model_config config, const char* checkpoint_path) {
 
     fprintf(stderr, "Model Initialized. GPU weight base: %p\n", (void*)m.d_weights_base);
     fprintf(stderr, "GPU activations base: %p\n", (void*)m.d_activations_base);
+    fprintf(stderr, "GPU KV Cache base: %p\n", (void*)m.d_kv_cache_base);
 
     return m;
 }
@@ -597,7 +601,8 @@ void prefill_forward(model* m, cudaStream_t stream, cublasHandle_t cublas_handle
         float* b_q_layer = m->d_weights.proj_b_q + (l * C);
         float* b_k_layer = m->d_weights.proj_b_k + (l * C);
         float* b_v_layer = m->d_weights.proj_b_v + (l * C);
-        // q_cache_scratch
+        
+        // We also have float* q_cache_scratch
         float* key_cache_layer = m->d_kv_cache.key_cache + (l * max_B * max_seq_len * C);
         float* value_cache_layer = m->d_kv_cache.value_cache + (l * max_B * max_seq_len * C);
         qkv_proj_append_to_KV_cache(cublas_handle, 
