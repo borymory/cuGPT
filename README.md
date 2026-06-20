@@ -22,19 +22,19 @@ The goal is understanding design considerations rather than reproducing existing
 
 ## **Implemented**
 
-- [x] **GPU** Layernorm 
-- [x] **GPU** FeedForward Neural Network
 - [x] **GPU** Token Embedding 
 - [x] **GPU** Positional Embedding
+- [x] **GPU** Layernorm 
+- [x] **GPU** Flash Attention + Causal Mask
+- [x] **GPU** FeedForward Neural Network
 - [x] **GPU** Language Model Head
-- [x] **Main Inference Loop** Tensor Loader and Pointer Slicer
+- [x] **Main Inference Loop** Tensor Loaders and Pointer Slicers
 - [x] **Main Inference Loop** Model Struct
 
 ## **In Progress**
 
 - [ ] **GPU** Online Softmax (with TOP-K)
 - [ ] **GPU** Logits Sampler
-- [ ] **GPU** Flash Attention + Causal Mask
 - [ ] **Main Inference Loop** Forward Pass
 
 # **Quick Start**
@@ -80,8 +80,8 @@ python ./generate.py
 - [ ] Inference Loop
   - [x] Weight Loader
   - [x] Model Initializer
+  - [x] KV Cache Implementation
   - [ ] Forward Pass Kernels
-  - [ ] KV Cache Implementation
 
 Future Direction:
 
