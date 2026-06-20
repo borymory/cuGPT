@@ -164,21 +164,17 @@ int warpId
             for (int c = 0; c < COLS_PER_WARP; ++c) {
                 int idx = warpLane + (c * 32);
                 int global_col = j + idx;
-                if (global_col < N) {
-                    // Casual Masking s_S
-                    if (global_row >= global_col) {
-                        float qk_sum = 0.0f;
+                // Casual Masking s_S
+                if (global_col < N && global_row >= global_col) {
+                    float qk_sum = 0.0f;
 
-                        #pragma unroll
-                        for (int k = 0; k < d; ++k) {
-                            float q_val = s_Q[warp_row * (d+1) + k];
-                            float k_val = s_K[k * (Bc+1) + idx];
-                            qk_sum += q_val * k_val;
-                        }
-                        s_S[warp_row * (Bc+1) + idx] = qk_sum * scale;
-                    } else {
-                        s_S[warp_row * (Bc+1) + idx] = -INFINITY;
+                    #pragma unroll
+                    for (int k = 0; k < d; ++k) {
+                        float q_val = s_Q[warp_row * (d+1) + k];
+                        float k_val = s_K[k * (Bc+1) + idx];
+                        qk_sum += q_val * k_val;
                     }
+                    s_S[warp_row * (Bc+1) + idx] = qk_sum * scale;
                 }
             }
             __syncwarp();
@@ -188,18 +184,13 @@ int warpId
             for (int c = 0; c < COLS_PER_WARP; ++c) {
                 int idx = warpLane + (c * 32);
                 int global_col = j + idx;
-                if (global_col < N) {
+                if (global_col < N && global_row >= global_col) {
                     float val = s_S[warp_row * (Bc+1) + idx];
                     
                     float m_old = m_i[r];     // store old local max
                     m_i[r] = fmaxf(m_i[r], val);    // obtain new local max
-
-                    if (m_i[r] != -INFINITY) {
-                        l_i[r] *= expf(m_old - m_i[r]); // scale old norm
-                        l_i[r] += expf(val - m_i[r]);   // add current contribution   
-                    } else {
-                        l_i[r] = 0.0f;
-                    }
+                    l_i[r] *= expf(m_old - m_i[r]); // scale old norm
+                    l_i[r] += expf(val - m_i[r]);   // add current contribution   
                 }
             }
 
@@ -226,10 +217,14 @@ int warpId
             #pragma unroll
             for (int c = 0; c < COLS_PER_WARP; ++c) {
                 int idx = warpLane + (c * 32);
-                float val = s_S[warp_row * (Bc+1) + idx];
                 int global_col = j + idx;
                 if (global_col < N) {
-                    s_S[warp_row * (Bc+1) + idx] = expf(val - m_i[r]);
+                    if (global_row >= global_col) {
+                        float val = s_S[warp_row * (Bc+1) + idx];
+                        s_S[warp_row * (Bc+1) + idx] = expf(val - m_i[r]);
+                    } else {
+                        s_S[warp_row * (Bc+1) + idx] = 0.0f;
+                    }
                 }
             }
             __syncwarp();
