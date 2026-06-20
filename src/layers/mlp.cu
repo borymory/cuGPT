@@ -175,18 +175,20 @@ void launch_fused_bias_residual_v1 (float *X, float *out, float *b2,
 //   W1: [C, 4 * C],  b1: [4 * C]
 //   W2: [4 * C, C],  b2: [C]
 //   out: [B * T, C]
-void mlp_forward_v1(cublasHandle_t cublas_handle, 
-                    float *X,       // Input [BT, C]
-                    float *h_out,   // Hidden output buffer [BT, 4*C]
-                    float *out,     // Final output [BT, C]
-                    float *W1, float *b1, // Weight and biases of layer 1
-                    float *W2, float *b2, // Weight and biases of layer 2
-                    int BT, int C, cudaStream_t stream) {
-    
+void mlp_forward_v1(
+    cublasHandle_t cublas_handle, 
+    float *X,       // Our residual
+    float* X_norm,  // Layernorm input to MLP
+    float *h_out,   // Hidden output buffer [BT, 4*C]
+    float *mlp_out,     // Final output [BT, C]
+    float *W1, float *b1, // Weight and biases of layer 1
+    float *W2, float *b2, // Weight and biases of layer 2
+    int BT, int C, cudaStream_t stream
+) {
     cublasSetStream(cublas_handle, stream);
 
-    // X [BT, C] * W1 [C, 4C] -> h_out [BT, 4C]
-    cuGPT::gemm(cublas_handle, X, W1, h_out, BT, 4 * C, C);
+    // X_norm [BT, C] * W1 [C, 4C] -> h_out [BT, 4C]
+    cuGPT::gemm(cublas_handle, X_norm, W1, h_out, BT, 4 * C, C);
 
     // ReLU(h_out [BT, 4C] + b1 [4C]) -> h_out [BT, 4C]
     const int block_BT_1 = 32;
@@ -195,13 +197,14 @@ void mlp_forward_v1(cublasHandle_t cublas_handle,
 
     fused_bias_ReLU_v1<block_BT_1><<<block_count, thread_count, 0, stream>>>(h_out, b1, BT, C);
 
-    // h_out [BT, 4C] * W2 [4C, C] -> out [BT, C]
-    cuGPT::gemm(cublas_handle, h_out, W2, out, BT, C, 4*C);
+    // h_out [BT, 4C] * W2 [4C, C] -> mlp_out [BT, C]
+    cuGPT::gemm(cublas_handle, h_out, W2, mlp_out, BT, C, 4*C);
 
-    // out [BT, C] + b2 [C] -> out [BT, C]
+    // mlp_out [BT, C] + b2 [C] -> mlp_out [BT, C]
     const int block_BT_2 = 32;
     block_count = CEIL_DIV(BT, block_BT_2);
     thread_count = block_BT_2 * 32;
 
-    fused_bias_residual_v1<block_BT_2><<<block_count, thread_count, 0, stream>>>(X, out, b2, BT, C);
+    // mlp_out + residual
+    fused_bias_residual_v1<block_BT_2><<<block_count, thread_count, 0, stream>>>(X, mlp_out, b2, BT, C);
 }

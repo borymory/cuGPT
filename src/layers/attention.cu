@@ -26,11 +26,16 @@ void cpu_attention(
             // QK matmul: Q[N, d], K[N, d]
             for (int q_row = 0; q_row < N; ++q_row) {
                 for (int k_row = 0; k_row < N; ++k_row) {
-                    float qk_sum = 0.0f;
-                    for (int k = 0; k < d; ++k) {
-                        qk_sum += Q_local[q_row * d + k] * K_local[k_row * d + k];
+                    // Casual Mask
+                    if (q_row >= k_row) {
+                        float qk_sum = 0.0f;
+                        for (int k = 0; k < d; ++k) {
+                            qk_sum += Q_local[q_row * d + k] * K_local[k_row * d + k];
+                        }
+                        S[q_row * N + k_row] = qk_sum * scale;
+                    } else {
+                        S[q_row * N + k_row] = -INFINITY;
                     }
-                    S[q_row * N + k_row] = qk_sum * scale;
                 }
             }
 
@@ -50,7 +55,11 @@ void cpu_attention(
                 }
 
                 for (int k = 0; k < N; ++k) {
-                    S[s_row * N + k] = expf(S[s_row * N + k] - m) / l;
+                    if (s_row >= k) {
+                        S[s_row * N + k] = expf(S[s_row * N + k] - m) / l;
+                    } else {
+                        S[s_row * N + k] = 0.0f;
+                    }
                 }
             }
 
@@ -156,15 +165,20 @@ int warpId
                 int idx = warpLane + (c * 32);
                 int global_col = j + idx;
                 if (global_col < N) {
-                    float qk_sum = 0.0f;
+                    // Casual Masking s_S
+                    if (global_row >= global_col) {
+                        float qk_sum = 0.0f;
 
-                    #pragma unroll
-                    for (int k = 0; k < d; ++k) {
-                        float q_val = s_Q[warp_row * (d+1) + k];
-                        float k_val = s_K[k * (Bc+1) + idx];
-                        qk_sum += q_val * k_val;
+                        #pragma unroll
+                        for (int k = 0; k < d; ++k) {
+                            float q_val = s_Q[warp_row * (d+1) + k];
+                            float k_val = s_K[k * (Bc+1) + idx];
+                            qk_sum += q_val * k_val;
+                        }
+                        s_S[warp_row * (Bc+1) + idx] = qk_sum * scale;
+                    } else {
+                        s_S[warp_row * (Bc+1) + idx] = -INFINITY;
                     }
-                    s_S[warp_row * (Bc+1) + idx] = qk_sum * scale;
                 }
             }
             __syncwarp();
@@ -180,8 +194,12 @@ int warpId
                     float m_old = m_i[r];     // store old local max
                     m_i[r] = fmaxf(m_i[r], val);    // obtain new local max
 
-                    l_i[r] *= expf(m_old - m_i[r]); // scale old norm
-                    l_i[r] += expf(val - m_i[r]);   // add current contribution
+                    if (m_i[r] != -INFINITY) {
+                        l_i[r] *= expf(m_old - m_i[r]); // scale old norm
+                        l_i[r] += expf(val - m_i[r]);   // add current contribution   
+                    } else {
+                        l_i[r] = 0.0f;
+                    }
                 }
             }
 
@@ -193,6 +211,7 @@ int warpId
 
                 float max = fmaxf(m_i[r], m_j);    // max = max(m_i, m_j)
 
+                // To prevent out-of-bound thread to propogate NaN
                 if (max != -INFINITY) {
                     l_i[r] *= expf(m_i[r] - max);    // rescale old sum
                     l_i[r] += l_j * expf(m_j - max);       // add contribution from the new sum

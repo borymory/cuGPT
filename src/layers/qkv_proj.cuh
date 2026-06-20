@@ -30,10 +30,10 @@ void cpu_proj_append_to_KV_cache(
 // qkv_proj kernel
 void qkv_proj_append_to_KV_cache(
     cublasHandle_t cublas_handle,
-    const float* __restrict__ X_norm, // [B * seq_len, C]
-    const float* __restrict__ w_q, // [C, C]
-    const float* __restrict__ w_k, // [C, C]
-    const float* __restrict__ w_v, // [C, C]
+    float* __restrict__ X_norm, // [B * seq_len, C]
+    float* __restrict__ w_q, // [C, C]
+    float* __restrict__ w_k, // [C, C]
+    float* __restrict__ w_v, // [C, C]
     const float* __restrict__ b_q, // [C]
     const float* __restrict__ b_k, // [C]
     const float* __restrict__ b_v, // [C]

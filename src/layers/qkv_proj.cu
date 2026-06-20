@@ -37,7 +37,7 @@ void cpu_proj_append_to_KV_cache(
         float* value_cache_local = value_cache + batch_offset;
         float* q_scratch_local = q_scratch + batch_offset;
 
-        for (int r = 0; r < seq_len; ++r) {
+        for (int r = 0; r < current_seq_len; ++r) {
             for (int c = 0; c < C; ++c) {
 
                 float q_sum = 0.0f;
@@ -104,10 +104,10 @@ void launch_proj_bias_add (
 // L dimension is handled by the pointer arithmetic.
 void qkv_proj_append_to_KV_cache(
     cublasHandle_t cublas_handle,
-    const float* __restrict__ X_norm, // [B * seq_len, C]
-    const float* __restrict__ w_q, // [C, C]
-    const float* __restrict__ w_k, // [C, C]
-    const float* __restrict__ w_v, // [C, C]
+    float* __restrict__ X_norm, // [B * seq_len, C]
+    float* __restrict__ w_q, // [C, C]
+    float* __restrict__ w_k, // [C, C]
+    float* __restrict__ w_v, // [C, C]
     const float* __restrict__ b_q, // [C]
     const float* __restrict__ b_k, // [C]
     const float* __restrict__ b_v, // [C]
