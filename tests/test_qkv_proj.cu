@@ -28,9 +28,10 @@ void test_qkv_proj_append_to_kv() {
  
   int B = 3;
   int current_seq_len = 32;
-  int C = 64;
-  int max_T = 64;
+  
   int max_B = 5;
+  int max_T = 64;
+  int C = 64;
 
   size_t X_size = B * current_seq_len * C * sizeof(float);
   size_t KV_size = max_B * max_T * C * sizeof(float);
@@ -94,31 +95,46 @@ void test_qkv_proj_append_to_kv() {
   CUDA_CHECK(cudaDeviceSynchronize());
 
   int Q_num_elements = B * current_seq_len * C;
-  if(!cuGPT::validate(Q, Q_cpu, Q_num_elements)) {
+  if(cuGPT::validate(Q, Q_cpu, Q_num_elements)) {
+    printf("Query_cache matches!\n");
+  } else {
     printf("Error: mismatch in query_cache\n");
   }
   
   // Compare outputs
   int KV_num_elements = current_seq_len * C;
   for (int b = 0; b < B; ++b) {
-    int batch_offset = b * (max_seq_len * C);
+    int batch_offset = b * (max_T * C);
 
     float* K_batch = K + batch_offset;
+    printf("Current batch_offset=%d\n", batch_offset);
     float* K_batch_cpu = K_cpu + batch_offset;
-    if (!cuGPT::validate(K_batch, K_batch_cpu, KV_num_elements)) {
-      printf("Error: mismatch in key_cache, at batch b=%d\n", b);
+    if (cuGPT::validate(K_batch, K_batch_cpu, KV_num_elements)) {
+      printf("Succes: Key_cache matches!\n");
+    } else {
+      printf("Error: Mismatch first seen in key_cache, at batch b=%d\n", b);
+      break;
     }
   }
 
   for (int b = 0; b < B; ++b) {
-    int batch_offset = b * (max_seq_len * C);
+    int batch_offset = b * (max_T * C);
 
     float* V_batch = V + batch_offset;
     float* V_batch_cpu = V_cpu + batch_offset;
-    if (!cuGPT::validate(V_batch, V_batch_cpu, KV_num_elements)) {
-      printf("Error: mismatch in value_cache, at batch b=%d\n", b);
+    printf("Current batch_offset=%d\n", batch_offset);
+    if (cuGPT::validate(V_batch, V_batch_cpu, KV_num_elements)) {
+      printf("Succes: Value_cache matches!\n");
+    } else {
+      printf("Error: Mismatch first seen in value_cache, at batch b=%d\n", b);
+      break;
     }
   }
+  size_t KV_utilized = (size_t)KV_num_elements * B * 2 * sizeof(float);
+  float perc_usage = ((float)KV_utilized / (2 * KV_size)) * 100;
+  printf("KV_Size (Bytes): %zu\n", 2 * KV_size);
+  printf("KV_Size Utilized (Bytes): %zu\n", KV_utilized);
+  printf("Total KV Cache usage: %f\n", perc_usage);
 
   // FREE MEMORY ALLOCATION
   CUDA_CHECK(cudaFree(X_norm));

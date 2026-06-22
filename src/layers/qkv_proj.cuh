@@ -20,28 +20,30 @@ void cpu_proj_append_to_KV_cache(
     float* b_v, // [C]
     float* key_cache,  // Written: [B, seq_len, C]
     float* value_cache, // Written: [B, seq_len, C]
-    float* q_scratch, // Written: [B, seq_len, C]
+    float* q_scratch, // Written: [B * seq_len, C]
     int B,
     int current_seq_len,
-    int C
+    int C,
+    int max_seq_len
 );
 
 
 // qkv_proj kernel
 void qkv_proj_append_to_KV_cache(
     cublasHandle_t cublas_handle,
-    float* __restrict__ X_norm, // [B * seq_len, C]
+    float* __restrict__ X_norm, // [B * current_seq_len, C]
     float* __restrict__ w_q, // [C, C]
     float* __restrict__ w_k, // [C, C]
     float* __restrict__ w_v, // [C, C]
     const float* __restrict__ b_q, // [C]
     const float* __restrict__ b_k, // [C]
     const float* __restrict__ b_v, // [C]
-    float* __restrict__ key_cache,  // Written: [B, seq_len, C]
-    float* __restrict__ value_cache, // Written: [B, seq_len, C]
-    float* __restrict__ q_scratch, // Written: [B, seq_len, C]
+    float* __restrict__ key_cache,  // Written: [B, current_seq_len, C]
+    float* __restrict__ value_cache, // Written: [B, current_seq_len, C]
+    float* __restrict__ q_scratch, // Written: [B * current_seq_len, C]
     const int B,
     const int current_seq_len,
     const int C,
+    const int max_seq_len,
     cudaStream_t stream
 );

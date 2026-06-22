@@ -883,19 +883,20 @@ void calculate_param_buffer_size (size_t* param_size, model_config config) {
 // Excluded max_B, since currently working at a single batch. Normally, these activations must be declares of size max_B*max_T*C.
 void calculate_activ_buffer_size (size_t* activ_size, model_config config) {
     int max_T = config.max_seq_len;
+    int max_B = config.max_batch;
     int V = config.vocab_size;
     int L = config.layers; // overwrite at each layer (seems possible)
     int C = config.channels;
 
-    activ_size[EMBED_OUT_IDX] = (size_t)max_T * C;
-    activ_size[X_NORM_IDX] = (size_t)max_T * C;
+    activ_size[EMBED_OUT_IDX] = (size_t)max_B * max_T * C;
+    activ_size[X_NORM_IDX] = (size_t)max_B * max_T * C;
 
-    activ_size[Q_SCRATCH_IDX] = (size_t)max_T * C;
-    activ_size[ATTN_OUT_IDX] = (size_t)max_T * C;
-    activ_size[O_PROJ_OUT_IDX] = (size_t)max_T * C;
+    activ_size[Q_SCRATCH_IDX] = (size_t)max_B * max_T * C;
+    activ_size[ATTN_OUT_IDX] = (size_t)max_B * max_T * C;
+    activ_size[O_PROJ_OUT_IDX] = (size_t)max_B * max_T * C;
 
-    activ_size[MLP_H_IDX] = (size_t)max_T * 4 * C;
-    activ_size[LOGITS_IDX] = (size_t)max_T * C;
+    activ_size[MLP_H_IDX] = (size_t)max_B * max_T * 4 * C;
+    activ_size[LOGITS_IDX] = (size_t)max_B * max_T * C;
     // populate activ_size array with further hidden activations
 }
 

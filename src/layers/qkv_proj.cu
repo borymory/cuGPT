@@ -24,10 +24,10 @@ void cpu_proj_append_to_KV_cache(
     // b * max_seq_len * C
     // Query tensor for different batches can be written one after another
     for (int b = 0; b < B; ++b) {
-        int KV_batch_offset = b * (max_seq_len * C);
-        int X_batch_offset = b * (current_seq_len * C);
+        int KV_batch_offset = b * (max_seq_len * C);    // batch offset for K and V
+        int batch_offset = b * (current_seq_len * C);   // batch offset for X and Q
 
-        float* X_norm_local = X_norm + X_batch_offset;
+        float* X_norm_local = X_norm + batch_offset;
         float* q_scratch_local = q_scratch + batch_offset;
 
         float* key_cache_local = key_cache + KV_batch_offset;
