@@ -1172,7 +1172,7 @@ void prefill_forward(model* m, cudaStream_t stream, cublasHandle_t cublas_handle
             stream
         );
 
-        // Output: o_proj_out [B, H, current_seq_len, d]
+        // Output: o_proj_out [B * current_seq_len, C]
         float* w_o_layer = m->d_weights.proj_w_o + (l * C * C);
         float* b_o_layer = m->d_weights.proj_b_o + (l * C);
         // Activation: attn_out, o_proj_out
@@ -1185,7 +1185,7 @@ void prefill_forward(model* m, cudaStream_t stream, cublasHandle_t cublas_handle
         );
 
         // Output: o_proj_out [B * current_seq_len, C]
-        // Activation: o_proj_out(OVERWRITTEN) embedding_out
+        // Activation: o_proj_out(OVERWRITTEN), embedding_out
         launch_residual_add(
             o_proj_out, 
             embedding_out,

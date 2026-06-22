@@ -3,24 +3,27 @@
 
 // CPU Func
 void cpu_attention(
-    const float* Q, // Shape: [B, H, N, d]
-    const float* K, // Shape: [B, H, N, d]
-    const float* V, // Shape: [B, H, N, d]
+    const float* Q, // Shape: [B, N, H, d]
+    const float* K, // Shape: [B, N, H, d]
+    const float* V, // Shape: [B, N, H, d]
     float *S,       // Shape: [N, N] (scrap)
-    float *O,       // Shape: [B, H, N, d]
+    float *O,       // Shape: [B, N, H, d]
     int B,
     int H,
     int N,
-    int d
+    int d,
+    int max_T
 ) 
 {
+    int C = H * d;
     float scale = 1.0f / sqrtf(d);
     for (int b = 0; b < B; ++b) {
         for (int h = 0; h < H; ++h) {
-            int offset = b * (H * N * d) + h * (N * d);
+            int offset = b * (N * C) + h * d;
+            int KV_offset = b * (max_T * C) + h * d;
             const float* Q_local = Q + offset;
-            const float* K_local = K + offset;
-            const float* V_local = V + offset;
+            const float* K_local = K + KV_offset;
+            const float* V_local = V + KV_offset;
             float* O_local = O + offset;
 
             // QK matmul: Q[N, d], K[N, d]
@@ -30,7 +33,7 @@ void cpu_attention(
                     if (q_row >= k_row) {
                         float qk_sum = 0.0f;
                         for (int k = 0; k < d; ++k) {
-                            qk_sum += Q_local[q_row * d + k] * K_local[k_row * d + k];
+                            qk_sum += Q_local[q_row * C + k] * K_local[k_row * C + k];
                         }
                         S[q_row * N + k_row] = qk_sum * scale;
                     } else {
@@ -68,9 +71,9 @@ void cpu_attention(
                 for (int v_col = 0; v_col < d; ++v_col) {
                     float pv_sum = 0.0f;
                     for (int k = 0; k < N; ++k) {
-                        pv_sum += S[p_row * N + k] * V_local[k * d + v_col];
+                        pv_sum += S[p_row * N + k] * V_local[k * C + v_col];
                     }
-                    O_local[p_row * d + v_col] = pv_sum;
+                    O_local[p_row * C + v_col] = pv_sum;
                 }
             }
         }
@@ -83,14 +86,16 @@ void cpu_attention(
 //
 
 // Assumes Row-Major layout: Pads SMEM with zeros if N is not divisible by Br or Bc
-__device__ __forceinline__ void fload_to_smem(float* __restrict__ shared_dst, 
+__device__ __forceinline__ void fload_to_smem(
+    float* __restrict__ shared_dst, 
     const float* __restrict__ global_src,
     int transpose, 
-    const int row_dim,
-    const int col_dim,
+    const int row_dim,  // Tile rows (Br or Bc)
+    const int col_dim,  // Tile col (d)
     const int padding,
-    const int global_row_offset,    // row offset from the beggining of [N, d]
-    const int max_rows
+    const int global_row_offset,    // Row offset from the beggining of [N, d]
+    const int max_rows,
+    const int ldgmem
 ) 
 {
     int num_elements = row_dim * col_dim;
@@ -102,8 +107,10 @@ __device__ __forceinline__ void fload_to_smem(float* __restrict__ shared_dst,
             int s_col = idx / col_dim;
             int s_row = idx % col_dim;
             int s_idx = s_row * ldsmem + s_col;
+            int g_idx = s_col * ldgmem + s_row;
+
             if ((global_row_offset + s_col) < max_rows) {
-                shared_dst[s_idx] = global_src[idx];
+                shared_dst[s_idx] = global_src[g_idx];
             } else {
                 shared_dst[s_idx] = 0.0f;
             }
@@ -116,8 +123,10 @@ __device__ __forceinline__ void fload_to_smem(float* __restrict__ shared_dst,
             int s_col = idx % col_dim;
             int s_row = idx / col_dim;
             int s_idx = s_row * ldsmem + s_col;
+            int g_idx = s_row * ldgmem + s_col;
+
             if ((global_row_offset + s_row) < max_rows) {
-                shared_dst[s_idx] = global_src[idx];
+                shared_dst[s_idx] = global_src[g_idx];
             } else {
                 shared_dst[s_idx] = 0.0f;
             }
@@ -281,25 +290,25 @@ const int ELEMENTS_PER_ROW,
 const int warp_count
 >
 __global__ void flash_mha_fwd_v1(
-    const float* __restrict__ Q, // Shape: [B, H, N, d]
-    const float* __restrict__ K, // Shape: [B, H, N, d]
-    const float* __restrict__ V, // Shape: [B, H, N, d]
-    float* __restrict__ O,       // Shape: [B, H, N, d]
+    const float* __restrict__ Q, // Shape: [B, N, H, d]
+    const float* __restrict__ K, // Shape: [B, N, H, d]
+    const float* __restrict__ V, // Shape: [B, N, H, d]
+    float* __restrict__ O,       // Shape: [B, N, H, d]
     const int H,
-    const int N                 // Same as sequence length
+    const int N,                // Same as sequence length
+    const int max_T
 ) {
     int head_idx = blockIdx.x;
     int batch_idx = blockIdx.y;
+    int C = H * d;
 
-    int stride_h = N * d;
-    int stride_b = H * N * d;
-
-    int block_offset = batch_idx * stride_b + head_idx * stride_h;
+    int block_offset = batch_idx * (N * C) + head_idx * d;
+    int block_offset_KV = batch_idx * (max_T * C) + head_idx * d;
 
     // Block Pointer Offsets
     const float *Q_local = Q + block_offset;
-    const float *K_local = K + block_offset;
-    const float *V_local = V + block_offset;
+    const float *K_local = K + block_offset_KV;
+    const float *V_local = V + block_offset_KV;
     float *O_local = O + block_offset;
 
     // Shared Memory
@@ -337,7 +346,7 @@ __global__ void flash_mha_fwd_v1(
         }
 
         // Populate s_Q
-        fload_to_smem(s_Q, Q_local + i * d, 0, Br, d, 1, i, N);
+        fload_to_smem(s_Q, Q_local + i * C, 0, Br, d, 1, i, N, C);
         __syncthreads();
 
         // Inner Loop over K and V: 
@@ -346,8 +355,8 @@ __global__ void flash_mha_fwd_v1(
         for (unsigned int j = 0; j < N; j += Bc) {
 
             // Populate rest smem: transpose K
-            fload_to_smem(s_K, K_local + j * d, 1, Bc, d, 1, j, N);
-            fload_to_smem(s_V, V_local + j * d, 0, Bc, d, 1, j, N);
+            fload_to_smem(s_K, K_local + j * C, 1, Bc, d, 1, j, N, C);
+            fload_to_smem(s_V, V_local + j * C, 0, Bc, d, 1, j, N, C);
             __syncthreads();
 
             // Initialize block-local stats per inner-loop
@@ -384,7 +393,7 @@ __global__ void flash_mha_fwd_v1(
                 for (int c = 0; c < ELEMENTS_PER_ROW; ++c) {
                     int idx = warpLane + (c * 32);
                     if (idx < d) {
-                        O_block[warp_row * d + idx] = inv_l * thread_res_O[r * ELEMENTS_PER_ROW + c];
+                        O_block[warp_row * C + idx] = inv_l * thread_res_O[r * ELEMENTS_PER_ROW + c];
                     }
                 }
             }
@@ -396,14 +405,15 @@ __global__ void flash_mha_fwd_v1(
 // Kernel Wrappers
 //
 void launch_flash_mha_fwd_v1(
-    const float* __restrict__ Q, // Shape: [B, H, N, d]
-    const float* __restrict__ K, // Shape: [B, H, N, d]
-    const float* __restrict__ V, // Shape: [B, H, N, d]
-    float* __restrict__ O,       // Shape: [B, H, N, d]
+    const float* __restrict__ Q, // Shape: [B, N, H, d]
+    const float* __restrict__ K, // Shape: [B, N, H, d]
+    const float* __restrict__ V, // Shape: [B, N, H, d]
+    float* __restrict__ O,       // Shape: [B, N, H, d]
     const int B,
     const int H,
     const int N,                 // Same as sequence length
     const int d,
+    const int max_T,
     cudaStream_t stream
 )
 {
@@ -424,7 +434,7 @@ void launch_flash_mha_fwd_v1(
 
     switch (d) {
         case 64: // GPT2 Case
-            flash_mha_fwd_v1<Br, Bc, 64, ROWS_PER_WARP, COLS_PER_WARP, ELEMENTS_PER_ROW, warp_count><<<gridDim, blockDim, shared_mem_bytes, stream>>>(Q, K, V, O, H, N);
+            flash_mha_fwd_v1<Br, Bc, 64, ROWS_PER_WARP, COLS_PER_WARP, ELEMENTS_PER_ROW, warp_count><<<gridDim, blockDim, shared_mem_bytes, stream>>>(Q, K, V, O, H, N, max_T);
             CHECK_LAST_CUDA_ERROR();
             break;
         default:
