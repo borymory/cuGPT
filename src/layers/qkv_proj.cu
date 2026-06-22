@@ -12,30 +12,26 @@ void cpu_proj_append_to_KV_cache(
     float* b_v, // [C]
     float* key_cache,  // Written: [B, seq_len, C]
     float* value_cache, // Written: [B, seq_len, C]
-    float* q_scratch, // Written: [B, seq_len, C]
+    float* q_scratch, // Written: [B * seq_len, C]
     int B,
     int current_seq_len,
-    int C
+    int C,
+    int max_seq_len
 ) 
 {
     // When appending caches for different batches, 
     // each batch's KV cache must be stored at an offset of
-    // b_idx * current_seq_len * C
-    // from the base KV_cache.
-
-    // We do not have to treat batches independently
-    // and can process them as a single huge chunk, 
-    // thus can share the whole KV cache buffer together
-
-    // For the sake of explicitness, I am writing with a batch offset to see
-    // whether my kernel behaves exact to this behaviour.
-    // One problem is, all batches must have exact seq_len.
+    // b * max_seq_len * C
+    // Query tensor for different batches can be written one after another
     for (int b = 0; b < B; ++b) {
-        int batch_offset = b * (current_seq_len * C);
-        float* X_norm_local = X_norm + batch_offset;
-        float* key_cache_local = key_cache + batch_offset;
-        float* value_cache_local = value_cache + batch_offset;
+        int KV_batch_offset = b * (max_seq_len * C);
+        int X_batch_offset = b * (current_seq_len * C);
+
+        float* X_norm_local = X_norm + X_batch_offset;
         float* q_scratch_local = q_scratch + batch_offset;
+
+        float* key_cache_local = key_cache + KV_batch_offset;
+        float* value_cache_local = value_cache + KV_batch_offset;
 
         for (int r = 0; r < current_seq_len; ++r) {
             for (int c = 0; c < C; ++c) {
@@ -104,31 +100,43 @@ void launch_proj_bias_add (
 // L dimension is handled by the pointer arithmetic.
 void qkv_proj_append_to_KV_cache(
     cublasHandle_t cublas_handle,
-    float* __restrict__ X_norm, // [B * seq_len, C]
+    float* __restrict__ X_norm, // [B * current_seq_len, C]
     float* __restrict__ w_q, // [C, C]
     float* __restrict__ w_k, // [C, C]
     float* __restrict__ w_v, // [C, C]
     const float* __restrict__ b_q, // [C]
     const float* __restrict__ b_k, // [C]
     const float* __restrict__ b_v, // [C]
-    float* __restrict__ key_cache,  // Written: [B, seq_len, C]
-    float* __restrict__ value_cache, // Written: [B, seq_len, C]
-    float* __restrict__ q_scratch, // Written: [B, seq_len, C]
+    float* __restrict__ key_cache,  // Written: [B, current_seq_len, C]
+    float* __restrict__ value_cache, // Written: [B, current_seq_len, C]
+    float* __restrict__ q_scratch, // Written: [B * current_seq_len, C]
     const int B,
     const int current_seq_len,
     const int C,
+    const int max_seq_len,
     cudaStream_t stream
 )
 {
     cublasSetStream(cublas_handle, stream);
 
-    // QKV Proj
-   cuGPT::gemm(cublas_handle, X_norm, w_q, q_scratch, B * current_seq_len, C, C);
-   cuGPT::gemm(cublas_handle, X_norm, w_k, key_cache, B * current_seq_len, C, C);
-   cuGPT::gemm(cublas_handle, X_norm, w_v, value_cache, B * current_seq_len, C, C);
+    // Q Proj
+    cuGPT::gemm(cublas_handle, X_norm, w_q, q_scratch, B * current_seq_len, C, C);
+    // Q Bias
+    launch_proj_bias_add(q_scratch, b_q, B, current_seq_len, C, stream);
 
-   // QKV Bias
-   launch_proj_bias_add(q_scratch, b_q, B, current_seq_len, C, stream);
-   launch_proj_bias_add(key_cache, b_k, B, current_seq_len, C, stream);
-   launch_proj_bias_add(value_cache, b_v, B, current_seq_len, C, stream);
+    // KV Cache appending is done by batch offsets
+    for (int b = 0; b < B; ++b) {
+        float* key_cache_batch = key_cache + (b * max_seq_len * C);
+        float* value_cache_batch = value_cache + (b * max_seq_len * C);
+        float* X_norm_batch = X_norm + (b * current_seq_len * C);
+        
+        // KV Proj
+       cuGPT::gemm(cublas_handle, X_norm_batch, w_k, key_cache_batch, current_seq_len, C, C);
+       cuGPT::gemm(cublas_handle, X_norm_batch, w_v, value_cache_batch, current_seq_len, C, C);
+
+       // KV Bias
+       launch_proj_bias_add(key_cache_batch, b_k, 1, current_seq_len, C, stream);
+       launch_proj_bias_add(value_cache_batch, b_v, 1, current_seq_len, C, stream);
+    }
+
 }

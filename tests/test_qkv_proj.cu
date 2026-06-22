@@ -11,7 +11,7 @@ void test_qkv_proj_append_to_kv() {
   cudaStream_t stream;
   
   // INPUTS
-  float* X_norm;  // [B * seq_len * C]
+  float* X_norm;  // [B * current_seq_len * C]
 
   // WEIGHTS AND BIASES
   float* w_q; float* b_q; // [C * C], [C]
@@ -19,30 +19,34 @@ void test_qkv_proj_append_to_kv() {
   float* w_v; float* b_v; // [C * C], [C]
 
   // OUTPUTS
-  float* Q;   // [B * seq_len * C]
-  float* K;   // [B * seq_len * C]
-  float* V;   // [B * seq_len * C]
-  float* Q_cpu;   // [B * seq_len * C]
-  float* K_cpu;   // [B * seq_len * C]
-  float* V_cpu;   // [B * seq_len * C]
+  float* Q;   // [B * current_seq_len * C]
+  float* K;   // [max_B * max_T * C]
+  float* V;   // [max_B * max_T * C]
+  float* Q_cpu;   // [B * current_seq_len * C]
+  float* K_cpu;   // [max_B * max_T * C]
+  float* V_cpu;   // [max_B * max_T * C]
  
-  int B = 2;
-  int seq_len = 32;
+  int B = 3;
+  int current_seq_len = 32;
   int C = 64;
+  int max_T = 64;
+  int max_B = 5;
 
-  size_t IO_size = B * seq_len * C * sizeof(float);
+  size_t X_size = B * current_seq_len * C * sizeof(float);
+  size_t KV_size = max_B * max_T * C * sizeof(float);
+  size_t Q_size = max_B * max_T * C * sizeof(float);
   size_t weight_size = C * C * sizeof(float);
   size_t bias_size = C * sizeof(float);
 
   // Memory Allocation
-  CUDA_CHECK(cudaMallocManaged((void**)&X_norm, IO_size));
-  CUDA_CHECK(cudaMallocManaged((void**)&Q, IO_size));
-  CUDA_CHECK(cudaMallocManaged((void**)&K, IO_size));
-  CUDA_CHECK(cudaMallocManaged((void**)&V, IO_size));
+  CUDA_CHECK(cudaMallocManaged((void**)&X_norm, X_size));
+  CUDA_CHECK(cudaMallocManaged((void**)&Q, Q_size));
+  CUDA_CHECK(cudaMallocManaged((void**)&K, KV_size));
+  CUDA_CHECK(cudaMallocManaged((void**)&V, KV_size));
   CUDA_CHECK(cudaStreamCreate(&stream));  
-  Q_cpu = (float*)malloc(IO_size);
-  K_cpu = (float*)malloc(IO_size);
-  V_cpu = (float*)malloc(IO_size);
+  Q_cpu = (float*)malloc(Q_size);
+  K_cpu = (float*)malloc(KV_size);
+  V_cpu = (float*)malloc(KV_size);
 
   CUDA_CHECK(cudaMallocManaged((void**)&w_q, weight_size));
   CUDA_CHECK(cudaMallocManaged((void**)&w_k, weight_size));
@@ -54,7 +58,7 @@ void test_qkv_proj_append_to_kv() {
   
 
   // INIT INPUT, WEIGHT AND BIAS
-  cuGPT::initMatrix(X_norm, B * seq_len, C);
+  cuGPT::initMatrix(X_norm, B * current_seq_len, C);
   cuGPT::initMatrix(w_q, C, C);
   cuGPT::initMatrix(w_k, C, C);
   cuGPT::initMatrix(w_v, C, C);
@@ -70,7 +74,9 @@ void test_qkv_proj_append_to_kv() {
     w_q, w_k, w_v,
     b_q, b_k, b_v,
     K_cpu, V_cpu, Q_cpu,
-    B, seq_len, C);
+    B, current_seq_len, C,
+    max_T
+  );
   fprintf(stderr, "DONE!\n");
 
   fprintf(stderr, "Running GPU_QKV_PROJ: ");
@@ -80,30 +86,38 @@ void test_qkv_proj_append_to_kv() {
     w_q, w_k, w_v,
     b_q, b_k, b_v,
     K, V, Q,
-    B, seq_len, C,
+    B, current_seq_len, C,
+    max_T,
     stream
   );
   fprintf(stderr, "DONE!\n");
   CUDA_CHECK(cudaDeviceSynchronize());
+
+  int Q_num_elements = B * current_seq_len * C;
+  if(!cuGPT::validate(Q, Q_cpu, Q_num_elements)) {
+    printf("Error: mismatch in query_cache\n");
+  }
   
   // Compare outputs
-  int num_elements = IO_size / sizeof(float);
-  if (cuGPT::validate(Q, Q_cpu, num_elements)) {
-    printf("Succes: query_scratch matches!\n");
-  } else {
-    printf("Error: mismatch in query_scratch\n");
+  int KV_num_elements = current_seq_len * C;
+  for (int b = 0; b < B; ++b) {
+    int batch_offset = b * (max_seq_len * C);
+
+    float* K_batch = K + batch_offset;
+    float* K_batch_cpu = K_cpu + batch_offset;
+    if (!cuGPT::validate(K_batch, K_batch_cpu, KV_num_elements)) {
+      printf("Error: mismatch in key_cache, at batch b=%d\n", b);
+    }
   }
 
-  if (cuGPT::validate(K, K_cpu, num_elements)) {
-    printf("Succes: key_cache matches!\n");
-  } else {
-    printf("Error: mismatch in key_cache\n");
-  }
+  for (int b = 0; b < B; ++b) {
+    int batch_offset = b * (max_seq_len * C);
 
-  if (cuGPT::validate(V, V_cpu, num_elements)) {
-    printf("Succes: value_cache matches!\n");
-  } else {
-    printf("Error: mismatch in value_cache\n");
+    float* V_batch = V + batch_offset;
+    float* V_batch_cpu = V_cpu + batch_offset;
+    if (!cuGPT::validate(V_batch, V_batch_cpu, KV_num_elements)) {
+      printf("Error: mismatch in value_cache, at batch b=%d\n", b);
+    }
   }
 
   // FREE MEMORY ALLOCATION

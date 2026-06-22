@@ -97,7 +97,8 @@ int warpId
             for (int c = 0; c < COLS_PER_WARP; ++c) {
                 int idx = warpLane + (c * 32);
                 int global_col = j + idx;
-                if (global_col < N) {
+                // Casual Masking s_S
+                if (global_col < N && global_row >= global_col) {
                     float qk_sum = 0.0f;
 
                     #pragma unroll
@@ -116,14 +117,13 @@ int warpId
             for (int c = 0; c < COLS_PER_WARP; ++c) {
                 int idx = warpLane + (c * 32);
                 int global_col = j + idx;
-                if (global_col < N) {
+                if (global_col < N && global_row >= global_col) {
                     float val = s_S[warp_row * (Bc+1) + idx];
                     
                     float m_old = m_i[r];     // store old local max
                     m_i[r] = fmaxf(m_i[r], val);    // obtain new local max
-
                     l_i[r] *= expf(m_old - m_i[r]); // scale old norm
-                    l_i[r] += expf(val - m_i[r]);   // add current contribution
+                    l_i[r] += expf(val - m_i[r]);   // add current contribution   
                 }
             }
 
@@ -135,6 +135,7 @@ int warpId
 
                 float max = fmaxf(m_i[r], m_j);    // max = max(m_i, m_j)
 
+                // To prevent out-of-bound thread to propogate NaN
                 if (max != -INFINITY) {
                     l_i[r] *= expf(m_i[r] - max);    // rescale old sum
                     l_i[r] += l_j * expf(m_j - max);       // add contribution from the new sum
@@ -149,10 +150,14 @@ int warpId
             #pragma unroll
             for (int c = 0; c < COLS_PER_WARP; ++c) {
                 int idx = warpLane + (c * 32);
-                float val = s_S[warp_row * (Bc+1) + idx];
                 int global_col = j + idx;
                 if (global_col < N) {
-                    s_S[warp_row * (Bc+1) + idx] = expf(val - m_i[r]);
+                    if (global_row >= global_col) {
+                        float val = s_S[warp_row * (Bc+1) + idx];
+                        s_S[warp_row * (Bc+1) + idx] = expf(val - m_i[r]);
+                    } else {
+                        s_S[warp_row * (Bc+1) + idx] = 0.0f;
+                    }
                 }
             }
             __syncwarp();
@@ -787,8 +792,14 @@ typedef struct {
     float* value_cache; // [L, max_B, max_T, C]
 } KV_cache;
 
+typedef struct{
+    int current_seq_len;
+    int current_batch = 0;
+} model_context
+
 typedef struct {
     model_config config;
+    model_context context;      // model context tracking
     model_activations d_activations;    // sliced device activations
     model_parameters d_weights; // sliced device weights
     KV_cache d_kv_cache;        // sliced device KV cache
@@ -798,16 +809,16 @@ typedef struct {
     float* d_activations_base;  // base ptr to device side activations
     float* d_kv_cache_base;     // base ptr to device side KV cache
 
-    // tokenized inputs
-    int* h_prompt;
-    int current_seq_len;
-    int* d_prompt;
+    // Model prompts
+    int* h_prompt;      // [max_B, max_T]
+    int* d_prompt;      // [max_B, max_T]
 
     // Creates host and device prompt buffer.
     // Currently copies a single batch, with no batch offsets from CPU to GPU
     void prompt(char* argv[], const int prompt_len) {
-        current_seq_len = prompt_len;
-        size_t max_context_size = (size_t)config.max_seq_len * sizeof(int);
+        context.current_seq_len = prompt_len;
+        context.current_batch += 1;
+        size_t max_context_size = (size_t)config.max_batch * config.max_seq_len * sizeof(int);
         h_prompt = (int*)malloc(max_context_size);
         if (!h_prompt) {
             fprintf(stderr, "Failed to allocate CPU memory for prompt tokens.\n");
@@ -821,7 +832,7 @@ typedef struct {
         CUDA_CHECK(cudaMalloc((void**)&d_prompt, max_context_size));
         CUDA_CHECK(cudaMemcpy(d_prompt, h_prompt, prompt_len * sizeof(int), cudaMemcpyHostToDevice));
 
-        fprintf(stderr, "Model Prompted. Prompt ptr located at: %p\n", (void*)d_prompt);
+        fprintf(stderr, "Model Prompted. Prompt ptr located at: %p\n", (void*)context.d_prompt);
     }
 } model;
 
@@ -1081,13 +1092,14 @@ void free_model(model* m) {
 //
 void prefill_forward(model* m, cudaStream_t stream, cublasHandle_t cublas_handle) {
     int current_seq_len = m->current_seq_len;
-    int C = m->config.channels;
-    int max_seq_len = m->config.max_seq_len;
     int L = m->config.layers;
-    int max_B = m->config.max_batch;
+    int B = m->config.current_batch;
     int H = m->config.heads;
+    int C = m->config.channels;
     int d_head = C / H; // 768/12 = 64
     int vocab_size = m->config.vocab_size;
+    int max_seq_len = m->config.max_seq_len;
+    int max_B = m->config.max_batch;
 
 
     // ACTIVATIONS: 
@@ -1138,7 +1150,8 @@ void prefill_forward(model* m, cudaStream_t stream, cublasHandle_t cublas_handle
         // Activation: q_cache_scratch
         float* key_cache_layer = m->d_kv_cache.key_cache + (l * max_B * max_seq_len * C);
         float* value_cache_layer = m->d_kv_cache.value_cache + (l * max_B * max_seq_len * C);
-        qkv_proj_append_to_KV_cache(cublas_handle, 
+        qkv_proj_append_to_KV_cache(
+            cublas_handle, 
             X_norm, 
             w_q_layer, w_k_layer, w_v_layer, 
             b_q_layer, b_k_layer, b_v_layer, 
@@ -1234,10 +1247,10 @@ void prefill_forward(model* m, cudaStream_t stream, cublasHandle_t cublas_handle
         stream
     );
 
-    // define ptr to the last logits row
     // x softmax (last logits overwrite)
     // x sampler (sample from last row of logits)
     // increase current_seq_len by one (for decode KV cache ofsetting)
+    m->current_seq_len += 1;
     // or for now feed back to prefill for fun!
 }
 
@@ -1278,6 +1291,7 @@ int main(int argc, char* argv[]) {
     // Decode Phase
     // include check whether <EOS> token is reached
 
+    // Copy d_prompt to h_prompt
     // Print last tokens
     for (int i = 0; i < prompt_len; ++i) {
         printf("%d ", cuGPT.h_prompt[i]);

@@ -109,25 +109,18 @@ void sample_top_k_from_probs(
 // GPU Kernels
 //
 
-template<const int MAX_K, const int block_B>
-__global__ void online_softmax_topk_temp_v1 (
-    const float *logits,    // [B, vocab_size]
-    float *top_k_probs,     // [B, MAX_K]
-    int *top_k_indices,     // [B, MAX_K]
+// Inputs logits[B, current_seq_len, vocab_size]
+// Outputs logits[B, current_seq_len, vocab_size]
+template<const int MAX_K, const int warp_count>
+__global__ void online_softmax_v1 (
+    float *logits,    // [B * current_seq_len, vocab_size]
     const int B, 
+    const int current_seq_len,
     const int vocab_size, 
-    const float temp)
+)
 {
-    // Launch CEIL_DIV(B, block_B) many blocks
-    int rowIdx = blockIdx.x * block_B;
-    logits += rowIdx * vocab_size;
-
-    float u[MAX_K];
-    int p[MAX_K];
-
-    for (int idx = threadIdx.x; idx < vocab_size; idx += blockDim.x) {
-        //
-    }
+    // Code Here
+    
 }
 
 //
