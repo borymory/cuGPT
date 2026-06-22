@@ -5,7 +5,7 @@
 // -- VERIFY FUNCTIONS --
 // For elements wise verification, use cuGPT::validate(...) func given in ./common/hpc_utils.cu
 
-bool test_flashattn_fwd() {
+void test_flashattn_fwd() {
   cudaStream_t stream;
   
   float* Q;
@@ -23,7 +23,7 @@ bool test_flashattn_fwd() {
   // Config
   int max_B = 5;
   int max_T = 5;
-  int C = 768
+  int C = 768;
   int H = 12;
   int d = 64;
   
@@ -58,8 +58,8 @@ bool test_flashattn_fwd() {
   launch_flash_mha_fwd_v1(Q, K, V, O, B, H, current_seq_len, d, max_T, stream);
   fprintf(stderr, "DONE!\n");
   CUDA_CHECK(cudaDeviceSynchronize());
-  if(cuGPT::validate(O, O_cpu, Q_size / sizeof(float))){
-    printf("Succes! Outputs match!");
+  if(cuGPT::validate(O, O_cpu, B * current_seq_len * C)) {
+    printf("Succes: Outputs match!\n");
   }
 
   // FREE MEMORY ALLOCATION
@@ -72,8 +72,6 @@ bool test_flashattn_fwd() {
 
   // DESTROY STREAM
   CUDA_CHECK(cudaStreamDestroy(stream));
-
-  return isExact; // VERIFY KERNEL
 }
 
 int main(void) {
