@@ -124,16 +124,16 @@ void sample_top_k_from_probs(
 // GPU Kernels
 //
 
-// Inputs d_logits[B, current_seq_len, vocab_size]
-// Outputs d_sampled_token[B]
+
 // BLOCK_SIZE = 512
-template<int BLOCK_SIZE, int TOP_K>
+template<int BLOCK_SIZE>
 __global__ void fused_sample_kernel(
     const float* __restrict__ d_logits,     // [B * current_seq_len, V]
-    int* __restrict__ d_sampled_token,      // [B]
+    int* __restrict__ d_prompt,             // [B, current_seq_len]
     unsigned int* d_seeds,                  // [B]
     const int current_seq_len,
     const int vocab_size,
+    const int max_seq_len,
     const float temperature
 ) {
     int b = blockIdx.x;
@@ -174,11 +174,15 @@ __global__ void fused_sample_kernel(
     int end_idx = min(start_idx + stride, vocab_size);
     float thread_sum = 0.0f;
     for (int i = start_idx; i < end_idx; ++i) {
-        thread_sum += expf((logits_local[i] - s_max_val) * inv_temp);
+        float val = logits_local[i];
+        if (val != -INFINITY) {
+            thread_sum += expf((val - s_max_val) * inv_temp);
+        }
     }
     s_sums[tid] = thread_sum;
     __syncthreads();
 
+    // Calculate CDF
     float val = s_sums[tid];
     for (int offset = 1; offset < BLOCK_SIZE; offset <<= 1) {
         float temp = 0.0f;
@@ -212,9 +216,87 @@ __global__ void fused_sample_kernel(
         for (int i = start_idx; i < end_idx; ++i) {
             running_accum += expf((logits_local[i] - s_max_val) * inv_temp);
             if (running_accum >= s_threshold) {
-                d_sampled_token[b] = i;     // The winning token ID
+                d_prompt[b * max_seq_len + current_seq_len] = i;     // The winning token ID
                 break;
             }
+        }
+    }
+}
+
+template<int TOP_K>
+__global__ void top_k_filter(
+    float* __restrict__ d_logits,     // [B * current_seq_len, V]
+    const int current_seq_len,
+    const int vocab_size,
+    const int max_seq_len
+) {
+    // We launch B many blocks
+    // blockDim.x = 32
+    int b = blockIdx.x;
+    float* logits_local = d_logits + b * (current_seq_len * vocab_size) + (current_seq_len - 1) * vocab_size;
+
+    float* top_k_i[TOP_K];
+    float* top_k_j[TOP_K];
+    float* merged[TOP_K];
+    for (int i = 0; i < TOP_K; ++i) {
+        top_k_i[i] = -INFINITY;
+    }
+
+    // Thread level top-k sorting
+    for (int idx = threadIdx.x; idx < vocab_size; idx += 32) {
+        float val = logits_local[idx];
+        if (val > top_k_i[TOP_K-1]) {
+            for (i = TOP_K-2; i >= 0; --i) {
+                // Commence local top-k swap
+                if (val > top_k_i[i]) {
+                    float temp_top_k = top_k_i[i];
+                    top_k_i[i] = val;
+                    top_k_i[i+1] = temp_top_k;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Each thread chunk does TOP_K reduction
+    #pragma unroll
+    for (unsigned int mirrorIdx = 1; mirrorIdx <= 16; mirrorIdx <<= 1) {
+
+        // Copy other threads top_k into our temp top_k register
+        #pragma unroll
+        for (int k = 0; k < TOP_K; ++k) {
+            top_k_j[k] = __shfl_xor_sync(FULL_MASK, top_k_i[k], mirrorIdx);
+        }
+
+        // Merge both our TOP_Ks
+        int i = 0;
+        int j = 0;
+        #pragma unroll
+        for (int k = 0; k < TOP_K; ++k) {
+            if(top_k[i] >= other_top_k[j]) {
+                merged[k] = top_k_i[i];
+                i++;
+            } else {
+                merged[k] = top_k_j[j];
+                j++;
+            }
+        }
+
+        // Copy result into top_k_i
+        #pragma unroll
+        for (int k = 0; k < TOP_K; ++k) {
+            float val = merged[k];
+            top_k_i[k] = val;
+        }
+    }
+
+    // Filter top-k elements
+    float cutoff = top_k_i[TOP_K-1];
+    for (int idx = threadIdx.x; idx < vocab_size; idx += 32) {
+        float val = logits_local[idx];
+        if (val < cutoff) {
+            logits_local[idx] = -INFINITY;
         }
     }
 }
@@ -223,20 +305,30 @@ __global__ void fused_sample_kernel(
 // Sampler Implementations
 //
 
-void launch_sampler(
-    const float* d_logits,
-    int* d_sampled_token,
+void launch_sampler_top_k(
+    const float* d_logits,  // [B * current_seq_len, C]
+    int* d_prompt,          // [B, current_seq_len]
     unsigned int* d_seeds,
     const int B,
     const int current_seq_len,
     const int vocab_size,
+    const int max_seq_len,
     const float temperature,
     cudaStream_t stream
 ) {
-    dim3 gridDim(B);
-    dim3 blockDim(512);
+    const int TOP_K = 50;
+    int grid_dim = B;
+    int block_dim = 32
+    top_k_filter<TOP_K><<<grid_dim, block_dim, 0, stream>>>(
+        d_logits,
+        current_seq_len,
+        vocab_size,
+        max_seq_len
+    );
+    CHECK_LAST_CUDA_ERROR();
 
-    fused_sample_kernel<512><<<gridDim, blockDim, 0, stream>>>(
+    block_dim = 512;
+    fused_sample_kernel<512><<<grid_dim, block_dim, 0, stream>>>(
         d_logits, 
         d_sampled_token, 
         d_seeds, 

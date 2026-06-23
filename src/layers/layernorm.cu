@@ -111,9 +111,10 @@ void layernorm_forward_v1(
     const float* __restrict__ beta,     // [C]
     const int B,
     const int current_seq_len, 
-    const int C
+    const int C,
     cudaStream_t stream
 ) {
+    int BT = B * current_seq_len;
     const int block_BT = 32;
     int block_count = CEIL_DIV(BT, block_BT);
     int thread_count = block_BT * 32;

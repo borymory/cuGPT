@@ -230,9 +230,16 @@ __global__ void embedding_v1(const int *inputs, float *out, const float *wte, co
     }
 }
 
-// Input: X[BT, C], X_norm[BT, C], alpha[C], beta[C]
 template<const int block_BT>
-__global__ void layernorm_fwd_v1(float *X, float *X_norm, float *alpha, float *beta, int BT, int C) {
+__global__ void layernorm_fwd_v1(
+    const float* __restrict__ X,        // [B * current_seq_len, C]
+    float* X_norm,                      // [B * current_seq_len, C]
+    const float* __restrict__ alpha,    // [C]
+    const float* __restrict__ beta,     // [C]
+    const int B,
+    const int current_seq_len, 
+    const int C
+) {
     // Launch CEIL_DIV(BT, block_BT) many blocks
     // Launch block_BT * 32 many threads
     const float eps = 1e-5f;    // to prevent divide by zero error
@@ -240,22 +247,18 @@ __global__ void layernorm_fwd_v1(float *X, float *X_norm, float *alpha, float *b
     int tx = threadIdx.x % 32;
     int ty = threadIdx.x / 32;
 
-    // offset blocks to rows
+    // Offset blocks to rows
     int rowIdx = blockIdx.x * block_BT;
-    int global_row_idx = ty + rowIdx;
+    X += rowIdx * C;
+    X_norm += rowIdx * C;
 
-    if (global_row_idx < BT) {
-        X += rowIdx * C;
-        X_norm += rowIdx * C;
-    
+    int global_row = ty + rowIdx;
+    if (global_row < B * current_seq_len) {
+
         // Mean Calculation
         float mean = 0.0f;
-        for (unsigned int i = 0; i < C; i += 32) {
-            int dIdx = tx + i;
-            // failsafe if C is not a multiple of 32
-            if (dIdx < C) {
-                mean += X[ty * C + dIdx];
-            }
+        for (unsigned int idx = tx; idx < C; idx += 32) {
+            mean += X[ty * C + idx];
         }
     
         for (unsigned int mirrorIdx = 1; mirrorIdx <= 16; mirrorIdx <<= 1) {
@@ -265,13 +268,9 @@ __global__ void layernorm_fwd_v1(float *X, float *X_norm, float *alpha, float *b
         
         // Standard Deviation Calculation
         float std_dev = 0.0f;
-        for (unsigned int i = 0; i < C; i += 32) {
-            int dIdx = tx + i;
-            // failsafe if C is not a multiple of 32
-            if (dIdx < C) {
-                float diff = X[ty * C + dIdx] - mean;
-                std_dev += diff * diff;
-            }
+        for (unsigned int idx = tx; idx < C; idx += 32) {
+            float diff = X[ty * C + idx] - mean;
+            std_dev += diff * diff;
         }
     
         for (unsigned int mirrorIdx = 1; mirrorIdx <= 16; mirrorIdx <<= 1) {
@@ -280,12 +279,8 @@ __global__ void layernorm_fwd_v1(float *X, float *X_norm, float *alpha, float *b
         std_dev = sqrtf((std_dev / C) + eps);
     
         // Update and load to X_norm
-        for (unsigned int i = 0; i < C; i += 32) {
-            int dIdx = tx + i;
-            // failsafe if C is not a multiple of 32
-            if (dIdx < C) {
-                X_norm[ty * C + dIdx] = ((X[ty * C + dIdx] - mean) / std_dev) * alpha[dIdx] + beta[dIdx];
-            }
+        for (unsigned int idx = tx; idx < C; idx += 32) {
+            X_norm[ty * C + idx] = ((X[ty * C + idx] - mean) / std_dev) * alpha[idx] + beta[idx];
         }
     }
 }
@@ -480,7 +475,7 @@ __global__ void fused_bias_residual_v1 (float *X, float *out, float *b2,
 template<int BLOCK_SIZE>
 __global__ void fused_sample_kernel(
     const float* __restrict__ d_logits,     // [B * current_seq_len, V]
-    int* __restrict__ d_prompt,      // [B, current_seq_len]
+    int* __restrict__ d_prompt,             // [B, current_seq_len]
     unsigned int* d_seeds,                  // [B]
     const int current_seq_len,
     const int vocab_size,
@@ -525,11 +520,15 @@ __global__ void fused_sample_kernel(
     int end_idx = min(start_idx + stride, vocab_size);
     float thread_sum = 0.0f;
     for (int i = start_idx; i < end_idx; ++i) {
-        thread_sum += expf((logits_local[i] - s_max_val) * inv_temp);
+        float val = logits_local[i];
+        if (val != -INFINITY) {
+            thread_sum += expf((val - s_max_val) * inv_temp);
+        }
     }
     s_sums[tid] = thread_sum;
     __syncthreads();
 
+    // Calculate CDF
     float val = s_sums[tid];
     for (int offset = 1; offset < BLOCK_SIZE; offset <<= 1) {
         float temp = 0.0f;
@@ -570,6 +569,84 @@ __global__ void fused_sample_kernel(
     }
 }
 
+template<int TOP_K>
+__global__ void top_k_filter(
+    float* __restrict__ d_logits,     // [B * current_seq_len, V]
+    const int current_seq_len,
+    const int vocab_size,
+    const int max_seq_len
+) {
+    // We launch B many blocks
+    // blockDim.x = 32
+    int b = blockIdx.x;
+    float* logits_local = d_logits + b * (current_seq_len * vocab_size) + (current_seq_len - 1) * vocab_size;
+
+    float* top_k_i[TOP_K];
+    float* top_k_j[TOP_K];
+    float* merged[TOP_K];
+    for (int i = 0; i < TOP_K; ++i) {
+        top_k_i[i] = -INFINITY;
+    }
+
+    // Thread level top-k sorting
+    for (int idx = threadIdx.x; idx < vocab_size; idx += 32) {
+        float val = logits_local[idx];
+        if (val > top_k_i[TOP_K-1]) {
+            for (i = TOP_K-2; i >= 0; --i) {
+                // Commence local top-k swap
+                if (val > top_k_i[i]) {
+                    float temp_top_k = top_k_i[i];
+                    top_k_i[i] = val;
+                    top_k_i[i+1] = temp_top_k;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Each thread chunk does TOP_K reduction
+    #pragma unroll
+    for (unsigned int mirrorIdx = 1; mirrorIdx <= 16; mirrorIdx <<= 1) {
+
+        // Copy other threads top_k into our temp top_k register
+        #pragma unroll
+        for (int k = 0; k < TOP_K; ++k) {
+            top_k_j[k] = __shfl_xor_sync(FULL_MASK, top_k_i[k], mirrorIdx);
+        }
+
+        // Merge both our TOP_Ks
+        int i = 0;
+        int j = 0;
+        #pragma unroll
+        for (int k = 0; k < TOP_K; ++k) {
+            if(top_k[i] >= other_top_k[j]) {
+                merged[k] = top_k_i[i];
+                i++;
+            } else {
+                merged[k] = top_k_j[j];
+                j++;
+            }
+        }
+
+        // Copy result into top_k_i
+        #pragma unroll
+        for (int k = 0; k < TOP_K; ++k) {
+            float val = merged[k];
+            top_k_i[k] = val;
+        }
+    }
+
+    // Filter top-k elements
+    float cutoff = top_k_i[TOP_K-1];
+    for (int idx = threadIdx.x; idx < vocab_size; idx += 32) {
+        float val = logits_local[idx];
+        if (val < cutoff) {
+            logits_local[idx] = -INFINITY;
+        }
+    }
+}
+
 //
 // Kernel Launchers
 //
@@ -583,15 +660,22 @@ void launch_embedding_v1(int *inputs, float *out, float *wte, float *wpe, int B,
     CHECK_LAST_CUDA_ERROR();
 }
 
-void layernorm_forward_v1(float *X, float *X_norm, 
-                          float *alpha, float *beta, 
-                          int BT, int C, 
-                          cudaStream_t stream) {
+void layernorm_forward_v1(
+    const float* __restrict__ X,        // [B * current_seq_len, C]
+    float* X_norm,                      // [B * current_seq_len, C]
+    const float* __restrict__ alpha,    // [C]
+    const float* __restrict__ beta,     // [C]
+    const int B,
+    const int current_seq_len, 
+    const int C,
+    cudaStream_t stream
+) {
+    int BT = B * current_seq_len;
     const int block_BT = 32;
     int block_count = CEIL_DIV(BT, block_BT);
     int thread_count = block_BT * 32;
 
-    layernorm_fwd_v1<block_BT><<<block_count, thread_count, 0, stream>>> (X, X_norm, alpha, beta, BT, C);
+    layernorm_fwd_v1<block_BT><<<block_count, thread_count, 0, stream>>> (X, X_norm, alpha, beta, B, current_seq_len, C);
     CHECK_LAST_CUDA_ERROR();
 }
 
@@ -793,9 +877,9 @@ void lm_head_fwd(
     cuGPT::gemm_transposed(cublas_handle, X_final, wte, logits, B * current_seq_len, vocab_size, C);
 }
 
-void launch_sampler(
+void launch_sampler_top_k(
     const float* d_logits,  // [B * current_seq_len, C]
-    int* d_prompt,  // [B, current_seq_len]
+    int* d_prompt,          // [B, current_seq_len]
     unsigned int* d_seeds,
     const int B,
     const int current_seq_len,
@@ -804,16 +888,24 @@ void launch_sampler(
     const float temperature,
     cudaStream_t stream
 ) {
-    dim3 gridDim(B);
-    dim3 blockDim(512);
+    const int TOP_K = 50;
+    int grid_dim = B;
+    int block_dim = 32
+    top_k_filter<TOP_K><<<grid_dim, block_dim, 0, stream>>>(
+        d_logits,
+        current_seq_len,
+        vocab_size,
+        max_seq_len
+    );
+    CHECK_LAST_CUDA_ERROR();
 
-    fused_sample_kernel<512><<<gridDim, blockDim, 0, stream>>>(
+    block_dim = 512;
+    fused_sample_kernel<512><<<grid_dim, block_dim, 0, stream>>>(
         d_logits, 
-        d_prompt, 
+        d_sampled_token, 
         d_seeds, 
         current_seq_len, 
         vocab_size, 
-        max_seq_len,
         temperature
     );
     CHECK_LAST_CUDA_ERROR();
@@ -1301,7 +1393,7 @@ void prefill_forward(model* m, cudaStream_t stream, cublasHandle_t cublas_handle
             embedding_out,  // Our pre-attn residual
             X_norm, 
             alpha_layer, beta_layer,
-            1 * current_seq_len, C,
+            1, current_seq_len, C,
             stream
         );
 
@@ -1367,7 +1459,7 @@ void prefill_forward(model* m, cudaStream_t stream, cublasHandle_t cublas_handle
             o_proj_out, // Our pre-MLP residual
             X_norm,
             alpha_layer, beta_layer,
-            1 * current_seq_len, C,
+            1, current_seq_len, C,
             stream
         );
 
@@ -1398,7 +1490,7 @@ void prefill_forward(model* m, cudaStream_t stream, cublasHandle_t cublas_handle
         embedding_out,
         X_norm,
         final_alpha_layer, final_beta_layer,
-        1 * current_seq_len, C,
+        1, current_seq_len, C,
         stream
     );
 
