@@ -127,7 +127,7 @@ void sample_top_k_from_probs(
 // Inputs d_logits[B, current_seq_len, vocab_size]
 // Outputs d_sampled_token[B]
 // BLOCK_SIZE = 512
-template<int BLOCK_SIZE>
+template<int BLOCK_SIZE, int TOP_K>
 __global__ void fused_sample_kernel(
     const float* __restrict__ d_logits,     // [B * current_seq_len, V]
     int* __restrict__ d_sampled_token,      // [B]

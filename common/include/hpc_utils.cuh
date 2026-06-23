@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <cuda_fp16.h>
+#define FULL_MASK 0xffffffffu // unsigned, safer in bit shifting
 
 
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))

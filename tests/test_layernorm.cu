@@ -34,11 +34,11 @@ bool test_layernorm_forward_v1() {
   cuGPT::initMatrix(beta, 1, C);
 
   std::printf("Running CPU Layernorm... | ");
-  cpu_layernorm_fwd(X, X_norm_cpu, alpha, beta, B * T, C);
+  cpu_layernorm_fwd(X, X_norm_cpu, alpha, beta, B, T, C);
   std::printf("✅ CPU Layernorm Finished\n");
 
   std::printf("Running GPU Layernorm Kernel... | ");
-  layernorm_forward_v1(X, X_norm, alpha, beta, B * T, C, stream);
+  layernorm_forward_v1(X, X_norm, alpha, beta, B, T, C, stream);
   CUDA_CHECK(cudaDeviceSynchronize());
   std::printf("✅ GPU Layernorm Finished\n");
 

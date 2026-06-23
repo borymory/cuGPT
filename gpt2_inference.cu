@@ -15,6 +15,17 @@
 //
 // Helper Funcs
 //
+
+// LCG Rand num generator
+__device__ unsigned int lcg_random(unsigned int* seed) {
+    *seed = 1664525U * (*seed) + 1013904223U;
+    return *seed;
+}
+
+__device__ float lcg_random_float(unsigned int* seed) {
+    return (float)lcg_random(seed) / (float)4294967295U;
+}
+
 // Assumes Row-Major layout: Pads SMEM with zeros if N is not divisible by Br or Bc
 __device__ __forceinline__ void fload_to_smem(
     float* __restrict__ shared_dst, 
@@ -231,49 +242,52 @@ __global__ void layernorm_fwd_v1(float *X, float *X_norm, float *alpha, float *b
 
     // offset blocks to rows
     int rowIdx = blockIdx.x * block_BT;
-    X += rowIdx * C;
-    X_norm += rowIdx * C;
+    int global_row_idx = ty + rowIdx;
 
-    // Mean Calculation
-    float mean = 0.0f;
-    for (unsigned int i = 0; i < C; i += 32) {
-        int dIdx = tx + i;
-        // failsafe if C is not a multiple of 32
-        if (dIdx < C) {
-            mean += X[ty * C + dIdx];
-        }
-    }
-
-    for (unsigned int mirrorIdx = 1; mirrorIdx <= 16; mirrorIdx <<= 1) {
-        mean += __shfl_xor_sync(FULL_MASK, mean, mirrorIdx);
-    }
-    mean /= C;
+    if (global_row_idx < BT) {
+        X += rowIdx * C;
+        X_norm += rowIdx * C;
     
-    // Standard Deviation Calculation
-    float std_dev = 0.0f;
-    for (unsigned int i = 0; i < C; i += 32) {
-        int dIdx = tx + i;
-        // failsafe if C is not a multiple of 32
-        if (dIdx < C) {
-            float diff = X[ty * C + dIdx] - mean;
-            std_dev += diff * diff;
+        // Mean Calculation
+        float mean = 0.0f;
+        for (unsigned int i = 0; i < C; i += 32) {
+            int dIdx = tx + i;
+            // failsafe if C is not a multiple of 32
+            if (dIdx < C) {
+                mean += X[ty * C + dIdx];
+            }
+        }
+    
+        for (unsigned int mirrorIdx = 1; mirrorIdx <= 16; mirrorIdx <<= 1) {
+            mean += __shfl_xor_sync(FULL_MASK, mean, mirrorIdx);
+        }
+        mean /= C;
+        
+        // Standard Deviation Calculation
+        float std_dev = 0.0f;
+        for (unsigned int i = 0; i < C; i += 32) {
+            int dIdx = tx + i;
+            // failsafe if C is not a multiple of 32
+            if (dIdx < C) {
+                float diff = X[ty * C + dIdx] - mean;
+                std_dev += diff * diff;
+            }
+        }
+    
+        for (unsigned int mirrorIdx = 1; mirrorIdx <= 16; mirrorIdx <<= 1) {
+            std_dev += __shfl_xor_sync(FULL_MASK, std_dev, mirrorIdx);
+        }
+        std_dev = sqrtf((std_dev / C) + eps);
+    
+        // Update and load to X_norm
+        for (unsigned int i = 0; i < C; i += 32) {
+            int dIdx = tx + i;
+            // failsafe if C is not a multiple of 32
+            if (dIdx < C) {
+                X_norm[ty * C + dIdx] = ((X[ty * C + dIdx] - mean) / std_dev) * alpha[dIdx] + beta[dIdx];
+            }
         }
     }
-
-    for (unsigned int mirrorIdx = 1; mirrorIdx <= 16; mirrorIdx <<= 1) {
-        std_dev += __shfl_xor_sync(FULL_MASK, std_dev, mirrorIdx);
-    }
-    std_dev = sqrtf((std_dev / C) + eps);
-
-    // Update and load to X_norm
-    for (unsigned int i = 0; i < C; i += 32) {
-        int dIdx = tx + i;
-        // failsafe if C is not a multiple of 32
-        if (dIdx < C) {
-            X_norm[ty * C + dIdx] = ((X[ty * C + dIdx] - mean) / std_dev) * alpha[dIdx] + beta[dIdx];
-        }
-    }
-
 }
 
 // Op: d_out [B * current_seq_len, C] + d_bias[C] (broadcasted to every row)
@@ -431,67 +445,46 @@ __global__ void residual_add(
     }
 }
 
+// ReLU(h_out [BT, 4C] + b1 [4C]) -> h_out [BT, 4C]
 // MLP bias+relu and bias+residual kernels
-template<const int block_BT>
-__global__ void fused_bias_ReLU_v1 (float *h_out, float *b1, 
-                                        int BT, int C) {
-    // Each block is responsible for block_BT many rows
-    // We launch CEIL_DIV(BT, block_BT) many blocks
+__global__ void fused_bias_ReLU_v1 (
+    float *h_out, // [BT, 4C]
+    float *b1,    // [4C]
+    int BT, 
+    int C
+) {
+    // Launch CEIL_DIV(BT * 4*C, 256) many blocks
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int num_elements = BT * 4 * C;
 
-    // Offset blocks to rows
-    int rowIdx = blockIdx.x * block_BT;
-    h_out += rowIdx * (4*C);
-
-    int tx = threadIdx.x;
-    // View data in block linearly
-    int element_size = block_BT * 4 * C;
-
-    for (unsigned int idx = 0; idx < element_size; idx += blockDim.x) {
-        // failsafe if dataIdx overshoots element_size
-        int dIdx = tx + idx;
-        if (dIdx < element_size) {
-            int biasIdx = dIdx % (4*C);
-            h_out[dIdx] = fmaxf(0.0f, h_out[dIdx] + b1[biasIdx]);
-        }
+    if (idx < num_elements) {
+        int bias_idx = idx % (4*C);
+        h_out[idx] = fmaxf(0.0f, h_out[idx] + b1[bias_idx]);
     }
 }
 
-template<const int block_BT>
 __global__ void fused_bias_residual_v1 (float *X, float *out, float *b2, 
                                             int BT, int C) {
-    // Each block is responsible for block_BT many rows
-    // We launch CEIL_DIV(BT, block_BT) many blocks
-
-    // Offset blocks to rows
-    int rowIdx = blockIdx.x * block_BT;
-    out += rowIdx * C;
-    X += rowIdx * C;
-
-    int tx = threadIdx.x;
-    // View data in block linearly
-    int element_size = block_BT * C;
-
-    // Element wise addition
-    for (unsigned int idx = 0; idx < element_size; idx += blockDim.x) {
-        // failsafe if condition
-        int dIdx = tx + idx;
-        if (dIdx < element_size) {
-            int biasIdx = dIdx % C;
-            out[dIdx] += X[dIdx] + b2[biasIdx];
-        }
+    // Launch CEIL_DIV(BT*C, 256) many blocks
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int num_elements = BT * C;
+    if (idx < num_elements) {
+        int bias_idx = idx % C;
+        out[idx] += X[idx] + b2[bias_idx];
     }
 }
 
 // Inputs d_logits[B, current_seq_len, vocab_size]
-// Outputs d_sampled_token[B]
+// Appends to d_prompt
 // BLOCK_SIZE = 512
 template<int BLOCK_SIZE>
 __global__ void fused_sample_kernel(
     const float* __restrict__ d_logits,     // [B * current_seq_len, V]
-    int* __restrict__ d_sampled_token,      // [B]
+    int* __restrict__ d_prompt,      // [B, current_seq_len]
     unsigned int* d_seeds,                  // [B]
     const int current_seq_len,
     const int vocab_size,
+    const int max_seq_len,
     const float temperature
 ) {
     int b = blockIdx.x;
@@ -570,7 +563,7 @@ __global__ void fused_sample_kernel(
         for (int i = start_idx; i < end_idx; ++i) {
             running_accum += expf((logits_local[i] - s_max_val) * inv_temp);
             if (running_accum >= s_threshold) {
-                d_sampled_token[b] = i;     // The winning token ID
+                d_prompt[b * max_seq_len + current_seq_len] = i;     // The winning token ID
                 break;
             }
         }
@@ -744,32 +737,40 @@ void mlp_forward_v1(
     float* X_norm,  // Layernorm input to MLP
     float *h_out,   // Hidden output buffer [BT, 4*C]
     float *mlp_out,     // Final output [BT, C]
-    float *W1, float *b1, // Weight and biases of layer 1
-    float *W2, float *b2, // Weight and biases of layer 2
-    int BT, int C, cudaStream_t stream
+    float *w1, float *b1, // Weight and biases of layer 1
+    float *w2, float *b2, // Weight and biases of layer 2
+    int B, int T, int C, cudaStream_t stream
 ) {
     cublasSetStream(cublas_handle, stream);
-
+    int thread_count = 256;
+    int BT = B * T;
     // X_norm [BT, C] * W1 [C, 4C] -> h_out [BT, 4C]
-    cuGPT::gemm(cublas_handle, X_norm, W1, h_out, BT, 4 * C, C);
+    cuGPT::gemm(cublas_handle, X_norm, w1, h_out, BT, 4 * C, C);
 
     // ReLU(h_out [BT, 4C] + b1 [4C]) -> h_out [BT, 4C]
-    const int block_BT_1 = 32;
-    int block_count = CEIL_DIV(BT, block_BT_1);
-    int thread_count = block_BT_1 * 32;
+    int block_count_1 = CEIL_DIV(BT * 4*C, 256);
 
-    fused_bias_ReLU_v1<block_BT_1><<<block_count, thread_count, 0, stream>>>(h_out, b1, BT, C);
+    fused_bias_ReLU_v1<<<block_count_1, thread_count, 0, stream>>>(
+        h_out, 
+        b1, 
+        BT, 
+        C
+    );
 
     // h_out [BT, 4C] * W2 [4C, C] -> mlp_out [BT, C]
-    cuGPT::gemm(cublas_handle, h_out, W2, mlp_out, BT, C, 4*C);
+    cuGPT::gemm(cublas_handle, h_out, w2, mlp_out, BT, C, 4*C);
 
     // mlp_out [BT, C] + b2 [C] -> mlp_out [BT, C]
-    const int block_BT_2 = 32;
-    block_count = CEIL_DIV(BT, block_BT_2);
-    thread_count = block_BT_2 * 32;
+    int block_count_2 = CEIL_DIV(BT * C, 256);
 
     // mlp_out + residual
-    fused_bias_residual_v1<block_BT_2><<<block_count, thread_count, 0, stream>>>(X, mlp_out, b2, BT, C);
+    fused_bias_residual_v1<<<block_count_2, thread_count, 0, stream>>>(
+        X, 
+        mlp_out, 
+        b2, 
+        BT, 
+        C
+    );
 }
 
 // X_final[BT, C], wte[vocab_size, C], logits[BT, vocab_size]
@@ -793,12 +794,13 @@ void lm_head_fwd(
 }
 
 void launch_sampler(
-    const float* d_logits,
-    int* d_sampled_token,
+    const float* d_logits,  // [B * current_seq_len, C]
+    int* d_prompt,  // [B, current_seq_len]
     unsigned int* d_seeds,
     const int B,
     const int current_seq_len,
     const int vocab_size,
+    const int max_seq_len,
     const float temperature,
     cudaStream_t stream
 ) {
@@ -807,10 +809,11 @@ void launch_sampler(
 
     fused_sample_kernel<512><<<gridDim, blockDim, 0, stream>>>(
         d_logits, 
-        d_sampled_token, 
+        d_prompt, 
         d_seeds, 
         current_seq_len, 
         vocab_size, 
+        max_seq_len,
         temperature
     );
     CHECK_LAST_CUDA_ERROR();
@@ -923,7 +926,7 @@ typedef struct {
     float* o_proj_out;  // [max_B, max_T, C]
 
     float* mlp_hidden;  // [max_B, max_T, 4 * C]
-    float* logits;  // [max_B, max_T, C]
+    float* logits;  // [max_B, max_T, V]
 } model_activations;
 
 typedef struct {
@@ -932,9 +935,9 @@ typedef struct {
 } KV_cache;
 
 typedef struct{
-    int current_seq_len;
+    int current_seq_len = 0;
     int current_batch = 0;
-} model_context
+} model_context;
 
 typedef struct {
     model_config config;
@@ -951,8 +954,6 @@ typedef struct {
     // Model prompts
     int* h_prompt;      // [max_B, max_T]
     int* d_prompt;      // [max_B, max_T]
-    int* d_sampled_token;   // [max_B]
-
     unsigned int* d_seeds;  // [max_B]
 
     // Creates host and device prompt buffer.
@@ -974,7 +975,7 @@ typedef struct {
         CUDA_CHECK(cudaMalloc((void**)&d_prompt, max_context_size));
         CUDA_CHECK(cudaMemcpy(d_prompt, h_prompt, prompt_len * sizeof(int), cudaMemcpyHostToDevice));
 
-        fprintf(stderr, "Model Prompted. Prompt ptr located at: %p\n", (void*)context.d_prompt);
+        fprintf(stderr, "Model Prompted. Prompt ptr located at: %p\n", (void*)d_prompt);
     }
 } model;
 
@@ -1022,7 +1023,7 @@ void calculate_param_buffer_size (size_t* param_size, model_config config) {
 
 // keeping batch==1 for now. declaring max_T instead of current 
 // since model can progress to max_seq_len if <EOS> is never met...
-// Excluded max_B, since currently working at a single batch. Normally, these activations must be declares of size max_B*max_T*C.
+// Excluded max_B, since currently working at a single batch. Normally, these activations must be declared of size max_B*max_T*C.
 void calculate_activ_buffer_size (size_t* activ_size, model_config config) {
     int max_T = config.max_seq_len;
     int max_B = config.max_batch;
@@ -1038,7 +1039,7 @@ void calculate_activ_buffer_size (size_t* activ_size, model_config config) {
     activ_size[O_PROJ_OUT_IDX] = (size_t)max_B * max_T * C;
 
     activ_size[MLP_H_IDX] = (size_t)max_B * max_T * 4 * C;
-    activ_size[LOGITS_IDX] = (size_t)max_B * max_T * C;
+    activ_size[LOGITS_IDX] = (size_t)max_B * max_T * V;
     // populate activ_size array with further hidden activations
 }
 
@@ -1147,7 +1148,6 @@ model init_model(model_config config, const char* checkpoint_path) {
     model m;
     m.config = config;
     m.d_seeds = init_model_seeds(m.config);
-    CUDA_CHECK(cudaMalloc((void**)&m.d_sampled_token, max_B * sizeof(unsigned int)));
 
     // calculate the total memory needed for specific model
     size_t activ_size[NUM_ACTIVATIONS];
@@ -1201,8 +1201,6 @@ model init_model(model_config config, const char* checkpoint_path) {
     fseek(file, 0, SEEK_END);
     size_t file_size = ftell(file);
     size_t expected_size = sizeof(file_header) + total_bytes;
-    // Free host side weights
-    free(m.h_weights_base);
     if (file_size != expected_size) {
         fprintf(stderr, "Error: Mismatch on file and expected size!\n");
         fprintf(stderr, "Expected: %zu bytes, Actual: %zu bytes", expected_size, file_size);
@@ -1249,7 +1247,6 @@ void free_model(model* m) {
     cudaFree(m->d_prompt);
     free(m->h_prompt);
     cudaFree(m->d_seeds);
-    cudaFree(m->d_sampled_token);
 }
 
 //
@@ -1266,9 +1263,8 @@ void prefill_forward(model* m, cudaStream_t stream, cublasHandle_t cublas_handle
     int vocab_size = m->config.vocab_size;
     int max_seq_len = m->config.max_seq_len;
     int max_B = m->config.max_batch;
-
     unsigned int* seeds = m->d_seeds;
-    int* sampled_token = m->d_sampled_token;
+
 
 
     // ACTIVATIONS: 
@@ -1290,12 +1286,12 @@ void prefill_forward(model* m, cudaStream_t stream, cublasHandle_t cublas_handle
     launch_embedding_v1(
         user_prompt,
         embedding_out, wte, wpe,
-        1, current_seq_len, C, max_seq_len,
+        1, current_seq_len, C, 
+        max_seq_len,
         stream
     );
 
-    // L-1 for proper layer offest indexology: 
-    for (int l = 0; l < L-1; ++l) {
+    for (int l = 0; l < L; ++l) {
 
         // embedding_out is the current residual
         // Output: X_norm [B * current_seq_len, C]
@@ -1364,8 +1360,8 @@ void prefill_forward(model* m, cudaStream_t stream, cublasHandle_t cublas_handle
         );
 
         // Output: X_norm [B * current_seq_len, C]
-        float* alpha_layer = m->d_weights.ln_2_alpha + (l * C);
-        float* beta_layer = m->d_weights.ln_2_beta + (l * C);
+        alpha_layer = m->d_weights.ln_2_alpha + (l * C);
+        beta_layer = m->d_weights.ln_2_beta + (l * C);
         // Activation: X_norm(OVERWRITTEN), o_proj_out
         layernorm_forward_v1(
             o_proj_out, // Our pre-MLP residual
@@ -1376,7 +1372,7 @@ void prefill_forward(model* m, cudaStream_t stream, cublasHandle_t cublas_handle
         );
 
         // Output: embedding_out [B * current_seq_len, C]
-        float* w1_layer = m->d_weights.ffn_f1 + (l * C * 4 * C);
+        float* w1_layer = m->d_weights.ffn_w1 + (l * C * 4 * C);
         float* b1_layer = m->d_weights.ffn_b1 + (l * 4 * C);
         float* w2_layer = m->d_weights.ffn_w2 + (l * 4 * C * C);
         float* b2_layer = m->d_weights.ffn_b2 + (l * C);
@@ -1389,7 +1385,7 @@ void prefill_forward(model* m, cudaStream_t stream, cublasHandle_t cublas_handle
             embedding_out,  // overwritten for the next layer
             w1_layer, b1_layer,
             w2_layer, b2_layer,
-            1 * current_seq_len, C,
+            1, current_seq_len, C,
             stream
         );
     }
@@ -1410,7 +1406,7 @@ void prefill_forward(model* m, cudaStream_t stream, cublasHandle_t cublas_handle
     // Activation: embedding_out, logits
     lm_head_fwd(
         cublas_handle,
-        embedding_out,
+        X_norm,
         wte,
         logits,
         1, current_seq_len, C,
@@ -1418,30 +1414,17 @@ void prefill_forward(model* m, cudaStream_t stream, cublasHandle_t cublas_handle
         stream
     );
 
-    // Output: sampled_token [B]
+    // Output: user_prompt [B, current_seq_len]
     // Activation: logits
-    fused_sample_kernel(
+    launch_sampler(
         logits,
-        sampled_token,
+        user_prompt,
         seeds,
         1, current_seq_len, vocab_size,
+        max_seq_len,
         temperature,
         stream
     );
-
-    // Append result
-    for (int b = 0; b < B; ++b) {
-        int* dst_ptr = user_prompt + b * max_seq_len + current_Seq_len;
-        const int* src_ptr = sampled_token + b;
-        
-        cudaMemcpyAsync(
-            dest_ptr,
-            src_ptr,
-            sizeof(int),
-            cudaMemcpyDeviceToDevice,
-            stream
-        );
-    }
 
     m->context.current_seq_len += 1;
 }
@@ -1449,12 +1432,49 @@ void prefill_forward(model* m, cudaStream_t stream, cublasHandle_t cublas_handle
 //
 // Main Inference Loop
 //
-
-int main(int argc, char* argv[]) {
+void generate(model* m) {
     cublasHandle_t cublas_handle;
     cublasCreate(&cublas_handle);
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
+
+    const int EOS_TOKEN_ID = 50256; // FOR GPT2
+    int max_T = m->config.max_seq_len;
+    int max_B = m->config.max_batch;
+    int current_seq_len = m->context.current_seq_len;
+    int current_batch = m->context.current_batch;
+    int* h_prompt = m->h_prompt;
+    int* d_prompt = m->d_prompt;
+
+    while (m->context.current_seq_len < m->config.max_seq_len) {
+        prefill_forward(m, stream, cublas_handle);
+        current_seq_len = m->context.current_seq_len;
+        CUDA_CHECK(cudaMemcpyAsync(
+            h_prompt, 
+            d_prompt, 
+            max_B * max_T * sizeof(int), 
+            cudaMemcpyDeviceToHost,
+            stream
+        ));
+        cudaStreamSynchronize(stream);
+
+        if (h_prompt[current_seq_len-1] == EOS_TOKEN_ID) {
+            break;
+        } else {
+            printf("%d ", h_prompt[current_seq_len - 1]);
+            fflush(stdout);
+        }
+    }
+    // Decode Phase
+    // include check whether <EOS> token is reached
+
+    // Copy d_prompt to h_prompt
+
+    cublasDestroy(cublas_handle);
+    CUDA_CHECK(cudaStreamDestroy(stream));
+}
+
+int main(int argc, char* argv[]) {
     // argc: argument count
     // argv[0] = program name
     // argv[1] = checkpoint path
@@ -1466,47 +1486,23 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
-    // Init model
+    // Initialize model
     const char* checkpoint_path = argv[1]; // "checkpoints/gpt2_124m.bin"
     model_config GPT2Config = {1024, 1, 50257, 12, 12, 768}; // max_batch = 1
     model cuGPT = init_model(GPT2Config, checkpoint_path);
-    const int EOS_TOKEN_ID = 50256; // FOR GPT2
 
     // Prompt model
-    int h_sampled_token;
     int prompt_len = argc - 2;
     cuGPT.prompt(argv, prompt_len);
     
-    // Inference loop:
+    // Print Host Prompt
     for (int i = 0; i < prompt_len; ++i) {
         printf("%d ", cuGPT.h_prompt[i]);
-    }
-    
-    // Prefill Phase
-    while(cuGPT.context.current_seq_len < cuGPT.config.max_seq_len) {
-        prefill_forward(&cuGPT, stream, cublas_handle);
-        cudaMemcpyAsync(
-            &h_sampled_token,
-            cuGPT.d_sampled_token,
-            sizeof(int),
-            cudaMemcpyDeviceToHost,
-            stream
-        );
-        cudaStreamSynchronize(stream);
-        if (h_sampled_token == EOS_TOKEN_ID) {
-            break;
-        }
-        printf("%d ", h_sampled_token);
         fflush(stdout);
     }
-
-    // Decode Phase
-    // include check whether <EOS> token is reached
-
-    // Copy d_prompt to h_prompt
+    
+    generate(&cuGPT);
 
     free_model(&cuGPT);
-    cublasDestroy(cublas_handle);
-    CUDA_CHECK(cudaStreamDestroy(stream));
     return 0;
 }
