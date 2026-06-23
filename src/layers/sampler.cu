@@ -1,7 +1,23 @@
 #include "hpc_utils.cuh"
 #include "sampler.cuh"
 
+//
+// Helpers
+//
 
+// LCG Rand num generator
+__device__ unsigned int lcg_random(unsigned int* seed) {
+    *seed = 1664525U * (*seed) + 1013904223U;
+    return *seed;
+}
+
+__device__ float lcg_random_float(unsigned int* seed) {
+    return (float)lcg_random(seed) / (float)4294967295U;
+}
+
+//
+// CPU Funcs
+//
 
 // logits[B, vocab_size], top_k_probs[B, MAX_K], top_k_indices[B, MAX_K]
 // returns list of indices and respective probs for sampling the next token.
@@ -76,7 +92,6 @@ void online_softmax_topk_temp(
     }
 }
 
-
 // u [B, MAX_K], p [B, MAX_K], next_tokens[B] (gives selected token ID for each batch)
 void sample_top_k_from_probs(
     const float *u, 
@@ -109,23 +124,129 @@ void sample_top_k_from_probs(
 // GPU Kernels
 //
 
-// Inputs logits[B, current_seq_len, vocab_size]
-// Outputs logits[B, current_seq_len, vocab_size]
-template<const int MAX_K, const int warp_count>
-__global__ void online_softmax_v1 (
-    float *logits,    // [B * current_seq_len, vocab_size]
-    const int B, 
+// Inputs d_logits[B, current_seq_len, vocab_size]
+// Outputs d_sampled_token[B]
+// BLOCK_SIZE = 512
+template<int BLOCK_SIZE>
+__global__ void fused_sample_kernel(
+    const float* __restrict__ d_logits,     // [B * current_seq_len, V]
+    int* __restrict__ d_sampled_token,      // [B]
+    unsigned int* d_seeds,                  // [B]
     const int current_seq_len,
-    const int vocab_size, 
-)
-{
-    // Code Here
-    
+    const int vocab_size,
+    const float temperature
+) {
+    int b = blockIdx.x;
+    int tid = threadIdx.x;
+
+    int block_offset = b * (current_seq_len * vocab_size) + (current_seq_len - 1) * vocab_size;
+    const float* logits_local = d_logits + block_offset;
+    const float inv_temp = 1.0f / temperature;
+
+    __shared__ float s_max_val;
+    __shared__ float s_total_sum;
+    __shared__ float s_threshold;
+    __shared__ float s_sums[BLOCK_SIZE]; // Local sums of the 512 threads
+
+    // Finding global max
+    float thread_max = -INFINITY;
+    for (int idx = tid; idx < vocab_size; idx += BLOCK_SIZE) {
+        thread_max = fmaxf(thread_max, logits_local[idx]);
+    }
+    s_sums[tid] = thread_max;
+    __syncthreads();
+
+    // Block-level reduction for global max
+    for (int offset = BLOCK_SIZE / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            s_sums[tid] = fmaxf(s_sums[tid], s_sums[tid + offset]);
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        s_max_val = s_sums[0];
+    }
+    __syncthreads();
+
+    // Calculating local sum
+    int stride = (vocab_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    int start_idx = tid * stride;
+    int end_idx = min(start_idx + stride, vocab_size);
+    float thread_sum = 0.0f;
+    for (int i = start_idx; i < end_idx; ++i) {
+        thread_sum += expf((logits_local[i] - s_max_val) * inv_temp);
+    }
+    s_sums[tid] = thread_sum;
+    __syncthreads();
+
+    float val = s_sums[tid];
+    for (int offset = 1; offset < BLOCK_SIZE; offset <<= 1) {
+        float temp = 0.0f;
+        if (tid >= offset) {
+            temp = s_sums[tid - offset];
+        }
+        __syncthreads();
+        s_sums[tid] += temp;
+        __syncthreads();
+    }
+    float thread_start_cumulative = (tid == 0) ? 0.0f : s_sums[tid - 1];
+    __syncthreads();
+    float thread_end_cumulative = thread_start_cumulative + val;
+
+    if (tid == BLOCK_SIZE - 1) {
+        s_total_sum = thread_end_cumulative;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        unsigned int seed = d_seeds[b];
+        float r = lcg_random_float(&seed);
+        d_seeds[b] = seed;
+        s_threshold = r * s_total_sum;
+    }
+    __syncthreads();
+
+    if (s_threshold >= thread_start_cumulative && s_threshold < thread_end_cumulative) {
+        float running_accum = thread_start_cumulative;
+
+        for (int i = start_idx; i < end_idx; ++i) {
+            running_accum += expf((logits_local[i] - s_max_val) * inv_temp);
+            if (running_accum >= s_threshold) {
+                d_sampled_token[b] = i;     // The winning token ID
+                break;
+            }
+        }
+    }
 }
 
 //
 // Sampler Implementations
 //
+
+void launch_sampler(
+    const float* d_logits,
+    int* d_sampled_token,
+    unsigned int* d_seeds,
+    const int B,
+    const int current_seq_len,
+    const int vocab_size,
+    const float temperature,
+    cudaStream_t stream
+) {
+    dim3 gridDim(B);
+    dim3 blockDim(512);
+
+    fused_sample_kernel<512><<<gridDim, blockDim, 0, stream>>>(
+        d_logits, 
+        d_sampled_token, 
+        d_seeds, 
+        current_seq_len, 
+        vocab_size, 
+        temperature
+    );
+    CHECK_LAST_CUDA_ERROR();
+}
+
 
 // PREFILL and DECODE
 // Input: logits[B, vocab_size]

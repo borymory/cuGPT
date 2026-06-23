@@ -397,7 +397,7 @@ __global__ void flash_mha_fwd_v1(
                     }
                 }
             }
-        } 
+        }
     }
 }
 

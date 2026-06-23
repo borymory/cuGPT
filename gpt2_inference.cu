@@ -16,14 +16,16 @@
 // Helper Funcs
 //
 // Assumes Row-Major layout: Pads SMEM with zeros if N is not divisible by Br or Bc
-__device__ __forceinline__ void fload_to_smem(float* __restrict__ shared_dst, 
+__device__ __forceinline__ void fload_to_smem(
+    float* __restrict__ shared_dst, 
     const float* __restrict__ global_src,
     int transpose, 
-    const int row_dim,
-    const int col_dim,
+    const int row_dim,  // Tile rows (Br or Bc)
+    const int col_dim,  // Tile col (d)
     const int padding,
-    const int global_row_offset,    // row offset from the beggining of [N, d]
-    const int max_rows
+    const int global_row_offset,    // Row offset from the beggining of [N, d]
+    const int max_rows,
+    const int ldgmem
 ) 
 {
     int num_elements = row_dim * col_dim;
@@ -35,8 +37,10 @@ __device__ __forceinline__ void fload_to_smem(float* __restrict__ shared_dst,
             int s_col = idx / col_dim;
             int s_row = idx % col_dim;
             int s_idx = s_row * ldsmem + s_col;
+            int g_idx = s_col * ldgmem + s_row;
+
             if ((global_row_offset + s_col) < max_rows) {
-                shared_dst[s_idx] = global_src[idx];
+                shared_dst[s_idx] = global_src[g_idx];
             } else {
                 shared_dst[s_idx] = 0.0f;
             }
@@ -49,8 +53,10 @@ __device__ __forceinline__ void fload_to_smem(float* __restrict__ shared_dst,
             int s_col = idx % col_dim;
             int s_row = idx / col_dim;
             int s_idx = s_row * ldsmem + s_col;
+            int g_idx = s_row * ldgmem + s_col;
+
             if ((global_row_offset + s_row) < max_rows) {
-                shared_dst[s_idx] = global_src[idx];
+                shared_dst[s_idx] = global_src[g_idx];
             } else {
                 shared_dst[s_idx] = 0.0f;
             }
@@ -298,25 +304,25 @@ const int ELEMENTS_PER_ROW,
 const int warp_count
 >
 __global__ void flash_mha_fwd_v1(
-    const float* __restrict__ Q, // Shape: [B, H, N, d]
-    const float* __restrict__ K, // Shape: [B, H, N, d]
-    const float* __restrict__ V, // Shape: [B, H, N, d]
-    float* __restrict__ O,       // Shape: [B, H, N, d]
+    const float* __restrict__ Q, // Shape: [B, N, H, d]
+    const float* __restrict__ K, // Shape: [B, N, H, d]
+    const float* __restrict__ V, // Shape: [B, N, H, d]
+    float* __restrict__ O,       // Shape: [B, N, H, d]
     const int H,
-    const int N                 // Same as sequence length
+    const int N,                // Same as sequence length
+    const int max_T
 ) {
     int head_idx = blockIdx.x;
     int batch_idx = blockIdx.y;
+    int C = H * d;
 
-    int stride_h = N * d;
-    int stride_b = H * N * d;
-
-    int block_offset = batch_idx * stride_b + head_idx * stride_h;
+    int block_offset = batch_idx * (N * C) + head_idx * d;
+    int block_offset_KV = batch_idx * (max_T * C) + head_idx * d;
 
     // Block Pointer Offsets
     const float *Q_local = Q + block_offset;
-    const float *K_local = K + block_offset;
-    const float *V_local = V + block_offset;
+    const float *K_local = K + block_offset_KV;
+    const float *V_local = V + block_offset_KV;
     float *O_local = O + block_offset;
 
     // Shared Memory
@@ -354,7 +360,7 @@ __global__ void flash_mha_fwd_v1(
         }
 
         // Populate s_Q
-        fload_to_smem(s_Q, Q_local + i * d, 0, Br, d, 1, i, N);
+        fload_to_smem(s_Q, Q_local + i * C, 0, Br, d, 1, i, N, C);
         __syncthreads();
 
         // Inner Loop over K and V: 
@@ -363,8 +369,8 @@ __global__ void flash_mha_fwd_v1(
         for (unsigned int j = 0; j < N; j += Bc) {
 
             // Populate rest smem: transpose K
-            fload_to_smem(s_K, K_local + j * d, 1, Bc, d, 1, j, N);
-            fload_to_smem(s_V, V_local + j * d, 0, Bc, d, 1, j, N);
+            fload_to_smem(s_K, K_local + j * C, 1, Bc, d, 1, j, N, C);
+            fload_to_smem(s_V, V_local + j * C, 0, Bc, d, 1, j, N, C);
             __syncthreads();
 
             // Initialize block-local stats per inner-loop
@@ -401,11 +407,11 @@ __global__ void flash_mha_fwd_v1(
                 for (int c = 0; c < ELEMENTS_PER_ROW; ++c) {
                     int idx = warpLane + (c * 32);
                     if (idx < d) {
-                        O_block[warp_row * d + idx] = inv_l * thread_res_O[r * ELEMENTS_PER_ROW + c];
+                        O_block[warp_row * C + idx] = inv_l * thread_res_O[r * ELEMENTS_PER_ROW + c];
                     }
                 }
             }
-        } 
+        }
     }
 }
 
@@ -476,6 +482,101 @@ __global__ void fused_bias_residual_v1 (float *X, float *out, float *b2,
     }
 }
 
+// Inputs d_logits[B, current_seq_len, vocab_size]
+// Outputs d_sampled_token[B]
+// BLOCK_SIZE = 512
+template<int BLOCK_SIZE>
+__global__ void fused_sample_kernel(
+    const float* __restrict__ d_logits,     // [B * current_seq_len, V]
+    int* __restrict__ d_sampled_token,      // [B]
+    unsigned int* d_seeds,                  // [B]
+    const int current_seq_len,
+    const int vocab_size,
+    const float temperature
+) {
+    int b = blockIdx.x;
+    int tid = threadIdx.x;
+
+    int block_offset = b * (current_seq_len * vocab_size) + (current_seq_len - 1) * vocab_size;
+    const float* logits_local = d_logits + block_offset;
+    const float inv_temp = 1.0f / temperature;
+
+    __shared__ float s_max_val;
+    __shared__ float s_total_sum;
+    __shared__ float s_threshold;
+    __shared__ float s_sums[BLOCK_SIZE]; // Local sums of the 512 threads
+
+    // Finding global max
+    float thread_max = -INFINITY;
+    for (int idx = tid; idx < vocab_size; idx += BLOCK_SIZE) {
+        thread_max = fmaxf(thread_max, logits_local[idx]);
+    }
+    s_sums[tid] = thread_max;
+    __syncthreads();
+
+    // Block-level reduction for global max
+    for (int offset = BLOCK_SIZE / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            s_sums[tid] = fmaxf(s_sums[tid], s_sums[tid + offset]);
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        s_max_val = s_sums[0];
+    }
+    __syncthreads();
+
+    // Calculating local sum
+    int stride = (vocab_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    int start_idx = tid * stride;
+    int end_idx = min(start_idx + stride, vocab_size);
+    float thread_sum = 0.0f;
+    for (int i = start_idx; i < end_idx; ++i) {
+        thread_sum += expf((logits_local[i] - s_max_val) * inv_temp);
+    }
+    s_sums[tid] = thread_sum;
+    __syncthreads();
+
+    float val = s_sums[tid];
+    for (int offset = 1; offset < BLOCK_SIZE; offset <<= 1) {
+        float temp = 0.0f;
+        if (tid >= offset) {
+            temp = s_sums[tid - offset];
+        }
+        __syncthreads();
+        s_sums[tid] += temp;
+        __syncthreads();
+    }
+    float thread_start_cumulative = (tid == 0) ? 0.0f : s_sums[tid - 1];
+    __syncthreads();
+    float thread_end_cumulative = thread_start_cumulative + val;
+
+    if (tid == BLOCK_SIZE - 1) {
+        s_total_sum = thread_end_cumulative;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        unsigned int seed = d_seeds[b];
+        float r = lcg_random_float(&seed);
+        d_seeds[b] = seed;
+        s_threshold = r * s_total_sum;
+    }
+    __syncthreads();
+
+    if (s_threshold >= thread_start_cumulative && s_threshold < thread_end_cumulative) {
+        float running_accum = thread_start_cumulative;
+
+        for (int i = start_idx; i < end_idx; ++i) {
+            running_accum += expf((logits_local[i] - s_max_val) * inv_temp);
+            if (running_accum >= s_threshold) {
+                d_sampled_token[b] = i;     // The winning token ID
+                break;
+            }
+        }
+    }
+}
+
 //
 // Kernel Launchers
 //
@@ -519,43 +620,57 @@ void launch_proj_bias_add (
 
 void qkv_proj_append_to_KV_cache(
     cublasHandle_t cublas_handle,
-    float* __restrict__ X_norm, // [B * seq_len, C]
+    float* __restrict__ X_norm, // [B * current_seq_len, C]
     float* __restrict__ w_q, // [C, C]
     float* __restrict__ w_k, // [C, C]
     float* __restrict__ w_v, // [C, C]
     const float* __restrict__ b_q, // [C]
     const float* __restrict__ b_k, // [C]
     const float* __restrict__ b_v, // [C]
-    float* __restrict__ key_cache,  // Written: [B, seq_len, C]
-    float* __restrict__ value_cache, // Written: [B, seq_len, C]
-    float* __restrict__ q_scratch, // Written: [B, seq_len, C]
+    float* __restrict__ key_cache,  // Written: [B, current_seq_len, C]
+    float* __restrict__ value_cache, // Written: [B, current_seq_len, C]
+    float* __restrict__ q_scratch, // Written: [B * current_seq_len, C]
     const int B,
     const int current_seq_len,
     const int C,
-    cudaStream_t stream)
+    const int max_seq_len,
+    cudaStream_t stream
+)
 {
     cublasSetStream(cublas_handle, stream);
-    
-    // QKV Proj
-    cuGPT::gemm(cublas_handle, X_norm, w_q, q_scratch, B * current_seq_len, C, C);
-    cuGPT::gemm(cublas_handle, X_norm, w_k, key_cache, B * current_seq_len, C, C);
-    cuGPT::gemm(cublas_handle, X_norm, w_v, value_cache, B * current_seq_len, C, C);
 
-    // QKV Bias
+    // Q Proj
+    cuGPT::gemm(cublas_handle, X_norm, w_q, q_scratch, B * current_seq_len, C, C);
+    // Q Bias
     launch_proj_bias_add(q_scratch, b_q, B, current_seq_len, C, stream);
-    launch_proj_bias_add(key_cache, b_k, B, current_seq_len, C, stream);
-    launch_proj_bias_add(value_cache, b_v, B, current_seq_len, C, stream);
+
+    // KV Cache appending is done by batch offsets
+    for (int b = 0; b < B; ++b) {
+        float* key_cache_batch = key_cache + (b * max_seq_len * C);
+        float* value_cache_batch = value_cache + (b * max_seq_len * C);
+        float* X_norm_batch = X_norm + (b * current_seq_len * C);
+        
+        // KV Proj
+       cuGPT::gemm(cublas_handle, X_norm_batch, w_k, key_cache_batch, current_seq_len, C, C);
+       cuGPT::gemm(cublas_handle, X_norm_batch, w_v, value_cache_batch, current_seq_len, C, C);
+
+       // KV Bias
+       launch_proj_bias_add(key_cache_batch, b_k, 1, current_seq_len, C, stream);
+       launch_proj_bias_add(value_cache_batch, b_v, 1, current_seq_len, C, stream);
+    }
+
 }
 
 void launch_flash_mha_fwd_v1(
-    const float* __restrict__ Q, // Shape: [B, H, N, d]
-    const float* __restrict__ K, // Shape: [B, H, N, d]
-    const float* __restrict__ V, // Shape: [B, H, N, d]
-    float* __restrict__ O,       // Shape: [B, H, N, d]
+    const float* __restrict__ Q, // Shape: [B, N, H, d]
+    const float* __restrict__ K, // Shape: [B, N, H, d]
+    const float* __restrict__ V, // Shape: [B, N, H, d]
+    float* __restrict__ O,       // Shape: [B, N, H, d]
     const int B,
     const int H,
     const int N,                 // Same as sequence length
     const int d,
+    const int max_T,
     cudaStream_t stream
 )
 {
@@ -576,7 +691,7 @@ void launch_flash_mha_fwd_v1(
 
     switch (d) {
         case 64: // GPT2 Case
-            flash_mha_fwd_v1<Br, Bc, 64, ROWS_PER_WARP, COLS_PER_WARP, ELEMENTS_PER_ROW, warp_count><<<gridDim, blockDim, shared_mem_bytes, stream>>>(Q, K, V, O, H, N);
+            flash_mha_fwd_v1<Br, Bc, 64, ROWS_PER_WARP, COLS_PER_WARP, ELEMENTS_PER_ROW, warp_count><<<gridDim, blockDim, shared_mem_bytes, stream>>>(Q, K, V, O, H, N, max_T);
             CHECK_LAST_CUDA_ERROR();
             break;
         default:
@@ -675,6 +790,30 @@ void lm_head_fwd(
     // X_final [BT, C]
     // wte  [vocab_size, C]
     cuGPT::gemm_transposed(cublas_handle, X_final, wte, logits, B * current_seq_len, vocab_size, C);
+}
+
+void launch_sampler(
+    const float* d_logits,
+    int* d_sampled_token,
+    unsigned int* d_seeds,
+    const int B,
+    const int current_seq_len,
+    const int vocab_size,
+    const float temperature,
+    cudaStream_t stream
+) {
+    dim3 gridDim(B);
+    dim3 blockDim(512);
+
+    fused_sample_kernel<512><<<gridDim, blockDim, 0, stream>>>(
+        d_logits, 
+        d_sampled_token, 
+        d_seeds, 
+        current_seq_len, 
+        vocab_size, 
+        temperature
+    );
+    CHECK_LAST_CUDA_ERROR();
 }
 
 //
@@ -812,6 +951,9 @@ typedef struct {
     // Model prompts
     int* h_prompt;      // [max_B, max_T]
     int* d_prompt;      // [max_B, max_T]
+    int* d_sampled_token;   // [max_B]
+
+    unsigned int* d_seeds;  // [max_B]
 
     // Creates host and device prompt buffer.
     // Currently copies a single batch, with no batch offsets from CPU to GPU
@@ -983,10 +1125,29 @@ float* malloc_and_point_to_KV_cache(model_config config, KV_cache* model_kv_cach
     return kv_cache_memory;
 }
 
+unsigned int* init_model_seeds(model_config config) {
+    int max_B = config.max_batch;
+
+    unsigned int* h_seeds;
+    h_seeds = (unsigned int*)malloc(max_B * sizeof(unsigned int));
+    for (int b = 0; b < max_B; ++b) {
+        h_seeds[b] = (unsigned int)time(NULL) + b;
+    }
+
+    unsigned int* d_seeds_memory;
+    CUDA_CHECK(cudaMalloc((void**)&d_seeds_memory, max_B * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMemcpy(d_seeds_memory, h_seeds, max_B * sizeof(unsigned int), cudaMemcpyHostToDevice));
+    free(h_seeds);
+
+    return d_seeds_memory;
+}
+
 // Initializes the model on GPU with weights loaded
 model init_model(model_config config, const char* checkpoint_path) {
     model m;
     m.config = config;
+    m.d_seeds = init_model_seeds(m.config);
+    CUDA_CHECK(cudaMalloc((void**)&m.d_sampled_token, max_B * sizeof(unsigned int)));
 
     // calculate the total memory needed for specific model
     size_t activ_size[NUM_ACTIVATIONS];
@@ -1076,6 +1237,7 @@ model init_model(model_config config, const char* checkpoint_path) {
     fprintf(stderr, "Model Initialized. GPU weight base: %p\n", (void*)m.d_weights_base);
     fprintf(stderr, "GPU activations base: %p\n", (void*)m.d_activations_base);
     fprintf(stderr, "GPU KV Cache base: %p\n", (void*)m.d_kv_cache_base);
+    fprintf(stderr, "GPU seed base: %p\n", (void*)m.d_seeds);
 
     return m;
 }
@@ -1086,21 +1248,27 @@ void free_model(model* m) {
     cudaFree(m->d_kv_cache_base);   // free device side KV cache
     cudaFree(m->d_prompt);
     free(m->h_prompt);
+    cudaFree(m->d_seeds);
+    cudaFree(m->d_sampled_token);
 }
 
 //
 // Forward Pass (B == 1) for now
 //
 void prefill_forward(model* m, cudaStream_t stream, cublasHandle_t cublas_handle) {
-    int current_seq_len = m->current_seq_len;
+    float temperature = 1.0f;
+    int current_seq_len = m->context.current_seq_len;
+    int B = m->context.current_batch;
     int L = m->config.layers;
-    int B = m->config.current_batch;
     int H = m->config.heads;
     int C = m->config.channels;
     int d_head = C / H; // 768/12 = 64
     int vocab_size = m->config.vocab_size;
     int max_seq_len = m->config.max_seq_len;
     int max_B = m->config.max_batch;
+
+    unsigned int* seeds = m->d_seeds;
+    int* sampled_token = m->d_sampled_token;
 
 
     // ACTIVATIONS: 
@@ -1158,6 +1326,7 @@ void prefill_forward(model* m, cudaStream_t stream, cublasHandle_t cublas_handle
             b_q_layer, b_k_layer, b_v_layer, 
             key_cache_layer, value_cache_layer, q_cache_scratch,
             1, current_seq_len, C, // Format: (current_batch, current_seq_len, channel)
+            max_seq_len,
             stream
         );
 
@@ -1169,6 +1338,7 @@ void prefill_forward(model* m, cudaStream_t stream, cublasHandle_t cublas_handle
             value_cache_layer,
             attn_out,
             1, H, current_seq_len, d_head,   // Format: (current_batch, head, current_seq_len, d_head)
+            max_seq_len,
             stream
         );
 
@@ -1248,11 +1418,32 @@ void prefill_forward(model* m, cudaStream_t stream, cublasHandle_t cublas_handle
         stream
     );
 
-    // x softmax (last logits overwrite)
-    // x sampler (sample from last row of logits)
-    // increase current_seq_len by one (for decode KV cache ofsetting)
-    m->current_seq_len += 1;
-    // or for now feed back to prefill for fun!
+    // Output: sampled_token [B]
+    // Activation: logits
+    fused_sample_kernel(
+        logits,
+        sampled_token,
+        seeds,
+        1, current_seq_len, vocab_size,
+        temperature,
+        stream
+    );
+
+    // Append result
+    for (int b = 0; b < B; ++b) {
+        int* dst_ptr = user_prompt + b * max_seq_len + current_Seq_len;
+        const int* src_ptr = sampled_token + b;
+        
+        cudaMemcpyAsync(
+            dest_ptr,
+            src_ptr,
+            sizeof(int),
+            cudaMemcpyDeviceToDevice,
+            stream
+        );
+    }
+
+    m->context.current_seq_len += 1;
 }
 
 //
@@ -1279,24 +1470,40 @@ int main(int argc, char* argv[]) {
     const char* checkpoint_path = argv[1]; // "checkpoints/gpt2_124m.bin"
     model_config GPT2Config = {1024, 1, 50257, 12, 12, 768}; // max_batch = 1
     model cuGPT = init_model(GPT2Config, checkpoint_path);
+    const int EOS_TOKEN_ID = 50256; // FOR GPT2
 
     // Prompt model
+    int h_sampled_token;
     int prompt_len = argc - 2;
     cuGPT.prompt(argv, prompt_len);
     
     // Inference loop:
-
+    for (int i = 0; i < prompt_len; ++i) {
+        printf("%d ", cuGPT.h_prompt[i]);
+    }
+    
     // Prefill Phase
-    prefill_forward(&cuGPT, stream, cublas_handle);
+    while(cuGPT.context.current_seq_len < cuGPT.config.max_seq_len) {
+        prefill_forward(&cuGPT, stream, cublas_handle);
+        cudaMemcpyAsync(
+            &h_sampled_token,
+            cuGPT.d_sampled_token,
+            sizeof(int),
+            cudaMemcpyDeviceToHost,
+            stream
+        );
+        cudaStreamSynchronize(stream);
+        if (h_sampled_token == EOS_TOKEN_ID) {
+            break;
+        }
+        printf("%d ", h_sampled_token);
+        fflush(stdout);
+    }
 
     // Decode Phase
     // include check whether <EOS> token is reached
 
     // Copy d_prompt to h_prompt
-    // Print last tokens
-    for (int i = 0; i < prompt_len; ++i) {
-        printf("%d ", cuGPT.h_prompt[i]);
-    }
 
     free_model(&cuGPT);
     cublasDestroy(cublas_handle);
