@@ -235,9 +235,9 @@ __global__ void top_k_filter(
     int b = blockIdx.x;
     float* logits_local = d_logits + b * (current_seq_len * vocab_size) + (current_seq_len - 1) * vocab_size;
 
-    float* top_k_i[TOP_K];
-    float* top_k_j[TOP_K];
-    float* merged[TOP_K];
+    float top_k_i[TOP_K];
+    float top_k_j[TOP_K];
+    float merged[TOP_K];
     for (int i = 0; i < TOP_K; ++i) {
         top_k_i[i] = -INFINITY;
     }
@@ -246,7 +246,9 @@ __global__ void top_k_filter(
     for (int idx = threadIdx.x; idx < vocab_size; idx += 32) {
         float val = logits_local[idx];
         if (val > top_k_i[TOP_K-1]) {
-            for (i = TOP_K-2; i >= 0; --i) {
+            top_k_i[TOP_K-1] = val;
+            
+            for (int i = TOP_K-2; i >= 0; --i) {
                 // Commence local top-k swap
                 if (val > top_k_i[i]) {
                     float temp_top_k = top_k_i[i];
@@ -274,7 +276,7 @@ __global__ void top_k_filter(
         int j = 0;
         #pragma unroll
         for (int k = 0; k < TOP_K; ++k) {
-            if(top_k[i] >= other_top_k[j]) {
+            if(top_k_i[i] >= top_k_j[j]) {
                 merged[k] = top_k_i[i];
                 i++;
             } else {
@@ -306,7 +308,7 @@ __global__ void top_k_filter(
 //
 
 void launch_sampler_top_k(
-    const float* d_logits,  // [B * current_seq_len, C]
+    float* d_logits,        // [B * current_seq_len, C]
     int* d_prompt,          // [B, current_seq_len]
     unsigned int* d_seeds,
     const int B,
@@ -318,7 +320,7 @@ void launch_sampler_top_k(
 ) {
     const int TOP_K = 50;
     int grid_dim = B;
-    int block_dim = 32
+    int block_dim = 32;
     top_k_filter<TOP_K><<<grid_dim, block_dim, 0, stream>>>(
         d_logits,
         current_seq_len,
@@ -330,14 +332,15 @@ void launch_sampler_top_k(
     block_dim = 512;
     fused_sample_kernel<512><<<grid_dim, block_dim, 0, stream>>>(
         d_logits, 
-        d_sampled_token, 
+        d_prompt, 
         d_seeds, 
         current_seq_len, 
         vocab_size, 
+        max_seq_len,
         temperature
     );
     CHECK_LAST_CUDA_ERROR();
-}
+}}
 
 
 // PREFILL and DECODE

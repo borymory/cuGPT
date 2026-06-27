@@ -16,6 +16,10 @@
 // Helper Funcs
 //
 
+__device__ __forceinline__ float gelu(float x) {
+    return 0.5f * x * (1.0f + tanhf(0.79788456f * (x + 0.044715f * x * x * x)));
+}
+
 // LCG Rand num generator
 __device__ unsigned int lcg_random(unsigned int* seed) {
     *seed = 1664525U * (*seed) + 1013904223U;
@@ -441,8 +445,8 @@ __global__ void residual_add(
 }
 
 // ReLU(h_out [BT, 4C] + b1 [4C]) -> h_out [BT, 4C]
-// MLP bias+relu and bias+residual kernels
-__global__ void fused_bias_ReLU_v1 (
+// MLP bias+gelu and bias+residual kernels
+__global__ void fused_bias_gelu_v1 (
     float *h_out, // [BT, 4C]
     float *b1,    // [4C]
     int BT, 
@@ -454,7 +458,7 @@ __global__ void fused_bias_ReLU_v1 (
 
     if (idx < num_elements) {
         int bias_idx = idx % (4*C);
-        h_out[idx] = fmaxf(0.0f, h_out[idx] + b1[bias_idx]);
+        h_out[idx] = gelu(h_out[idx] + b1[bias_idx]);
     }
 }
 
@@ -474,7 +478,7 @@ __global__ void fused_bias_residual_v1 (float *X, float *out, float *b2,
 // BLOCK_SIZE = 512
 template<int BLOCK_SIZE>
 __global__ void fused_sample_kernel(
-    const float* __restrict__ d_logits,     // [B * current_seq_len, V]
+    float* __restrict__ d_logits,     // [B * current_seq_len, V]
     int* __restrict__ d_prompt,             // [B, current_seq_len]
     unsigned int* d_seeds,                  // [B]
     const int current_seq_len,
@@ -581,9 +585,9 @@ __global__ void top_k_filter(
     int b = blockIdx.x;
     float* logits_local = d_logits + b * (current_seq_len * vocab_size) + (current_seq_len - 1) * vocab_size;
 
-    float* top_k_i[TOP_K];
-    float* top_k_j[TOP_K];
-    float* merged[TOP_K];
+    float top_k_i[TOP_K];
+    float top_k_j[TOP_K];
+    float merged[TOP_K];
     for (int i = 0; i < TOP_K; ++i) {
         top_k_i[i] = -INFINITY;
     }
@@ -592,7 +596,9 @@ __global__ void top_k_filter(
     for (int idx = threadIdx.x; idx < vocab_size; idx += 32) {
         float val = logits_local[idx];
         if (val > top_k_i[TOP_K-1]) {
-            for (i = TOP_K-2; i >= 0; --i) {
+            top_k_i[TOP_K-1] = val;
+            
+            for (int i = TOP_K-2; i >= 0; --i) {
                 // Commence local top-k swap
                 if (val > top_k_i[i]) {
                     float temp_top_k = top_k_i[i];
@@ -620,7 +626,7 @@ __global__ void top_k_filter(
         int j = 0;
         #pragma unroll
         for (int k = 0; k < TOP_K; ++k) {
-            if(top_k[i] >= other_top_k[j]) {
+            if(top_k_i[i] >= top_k_j[j]) {
                 merged[k] = top_k_i[i];
                 i++;
             } else {
@@ -834,7 +840,7 @@ void mlp_forward_v1(
     // ReLU(h_out [BT, 4C] + b1 [4C]) -> h_out [BT, 4C]
     int block_count_1 = CEIL_DIV(BT * 4*C, 256);
 
-    fused_bias_ReLU_v1<<<block_count_1, thread_count, 0, stream>>>(
+    fused_bias_gelu_v1<<<block_count_1, thread_count, 0, stream>>>(
         h_out, 
         b1, 
         BT, 
@@ -878,7 +884,7 @@ void lm_head_fwd(
 }
 
 void launch_sampler_top_k(
-    const float* d_logits,  // [B * current_seq_len, C]
+    float* d_logits,        // [B * current_seq_len, C]
     int* d_prompt,          // [B, current_seq_len]
     unsigned int* d_seeds,
     const int B,
@@ -890,7 +896,7 @@ void launch_sampler_top_k(
 ) {
     const int TOP_K = 50;
     int grid_dim = B;
-    int block_dim = 32
+    int block_dim = 32;
     top_k_filter<TOP_K><<<grid_dim, block_dim, 0, stream>>>(
         d_logits,
         current_seq_len,
@@ -902,10 +908,11 @@ void launch_sampler_top_k(
     block_dim = 512;
     fused_sample_kernel<512><<<grid_dim, block_dim, 0, stream>>>(
         d_logits, 
-        d_sampled_token, 
+        d_prompt, 
         d_seeds, 
         current_seq_len, 
         vocab_size, 
+        max_seq_len,
         temperature
     );
     CHECK_LAST_CUDA_ERROR();
@@ -1345,7 +1352,7 @@ void free_model(model* m) {
 // Forward Pass (B == 1) for now
 //
 void prefill_forward(model* m, cudaStream_t stream, cublasHandle_t cublas_handle) {
-    float temperature = 1.0f;
+    float temperature = 0.7f;
     int current_seq_len = m->context.current_seq_len;
     int B = m->context.current_batch;
     int L = m->config.layers;
@@ -1508,7 +1515,7 @@ void prefill_forward(model* m, cudaStream_t stream, cublasHandle_t cublas_handle
 
     // Output: user_prompt [B, current_seq_len]
     // Activation: logits
-    launch_sampler(
+    launch_sampler_top_k(
         logits,
         user_prompt,
         seeds,
