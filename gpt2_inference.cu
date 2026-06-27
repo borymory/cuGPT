@@ -1061,8 +1061,8 @@ typedef struct {
         context.current_seq_len = prompt_len;
         context.current_batch += 1;
         size_t max_context_size = (size_t)config.max_batch * config.max_seq_len * sizeof(int);
-        h_prompt = (int*)malloc(max_context_size);
-        if (!h_prompt) {
+        cudaError_t h_prompt_status = cudaMallocHost((void**)&h_prompt, max_context_size); // Use page-locked memory to minimize CPU-GPU prompt copy time
+        if (h_prompt_status != cudaSuccess) {
             fprintf(stderr, "Failed to allocate CPU memory for prompt tokens.\n");
             exit(EXIT_FAILURE);
         }
@@ -1344,7 +1344,7 @@ void free_model(model* m) {
     cudaFree(m->d_activations_base);    // free device side activations
     cudaFree(m->d_kv_cache_base);   // free device side KV cache
     cudaFree(m->d_prompt);
-    free(m->h_prompt);
+    cudaFreeHost(m->h_prompt);
     cudaFree(m->d_seeds);
 }
 
